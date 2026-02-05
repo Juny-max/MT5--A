@@ -1393,7 +1393,7 @@ void CheckForEntry()
     // ===================================================================
     // MATH UPGRADE: DYNAMIC SLOPE THRESHOLD USING ATR
     // Old: Fixed 0.00008 (too strict on slow days)
-    // New: ATR(14) * 0.1 (adapts to market volatility)
+    // New: ATR(14) * 0.04 (tuned for steady trends)
     // ===================================================================
     double atrValue[];
     ArraySetAsSeries(atrValue, true);
@@ -1402,7 +1402,7 @@ void CheckForEntry()
     
     if(CopyBuffer(atrHandle, 0, 0, 1, atrValue) == 1)
     {
-        dynamicMinSlope = atrValue[0] * 0.1;  // 10% of ATR
+        dynamicMinSlope = atrValue[0] * 0.04;  // 4% of ATR (less strict)
         if(EnableTestMode)
         {
             Print("ATR-based slope: ATR=", DoubleToString(atrValue[0], 5), 
