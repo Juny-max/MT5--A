@@ -477,6 +477,7 @@ datetime lastSpreadCheck = 0;
 
 int emaHandle = INVALID_HANDLE;
 int rsiHandle = INVALID_HANDLE;
+int atrHandle = INVALID_HANDLE;  // ATR for dynamic slope threshold
 
 datetime lastHistoryCheck = 0;
 int lastHistoryTotal = 0;
@@ -681,8 +682,9 @@ int OnInit()
     // Initialize indicators
     emaHandle = iMA(_Symbol, EMAPeriodTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
     rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RSIPeriod, PRICE_CLOSE);
+    atrHandle = iATR(_Symbol, PERIOD_H1, 14);  // ATR on H1 for dynamic slope threshold
     
-    if(emaHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE)
+    if(emaHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE || atrHandle == INVALID_HANDLE)
     {
         Print("ERROR: Failed to create indicators");
         return INIT_FAILED;
@@ -738,9 +740,9 @@ int OnInit()
     // CRITIC FIX 4: Configuration verification logs
     Print("================================================");
     Print("✅ CONFIGURATION VERIFIED:");
-    Print("✅ RSI zones: Non-overlapping (BUY: 48-70, SELL: 30-52)");
-    Print("✅ Trend filter: 0.008% separation active");
-    Print("✅ EMA slope threshold: 0.00008 (normal momentum)");
+    Print("✅ RSI zones: WIDENED (BUY: 45-75, SELL: 25-55)");
+    Print("✅ Trend filter: 0.004% (catches trend starts earlier)");
+    Print("✅ EMA slope: ATR-based dynamic (adapts to volatility)");
     Print("✅ Timeframe: ", EnumToString(_Period), " (M5 or higher)");
     Print("✅ Small Account Mode: ", EnableSmallAccountMode ? "ENABLED" : "DISABLED");
     if(EnableSmallAccountMode) 
@@ -760,6 +762,7 @@ void OnDeinit(const int reason)
 {
     if(emaHandle != INVALID_HANDLE) IndicatorRelease(emaHandle);
     if(rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
+    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
     
     Print("=== EA Deinitialized ===");
 }
@@ -1271,8 +1274,9 @@ bool IsMarketTrending()
     IndicatorRelease(ema50Handle);
     IndicatorRelease(ema100Handle);
     
-    // Market is trending if EMAs are separated by at least 0.008%
-    bool isTrending = (separationPercent >= 0.008);
+    // Market is trending if EMAs are separated by at least 0.004%
+    // MATH UPGRADE: Lowered from 0.008% to catch trend starts earlier
+    bool isTrending = (separationPercent >= 0.004);
     
     // Enhanced logging with actual values
     static datetime lastRegimeLog = 0;
@@ -1281,7 +1285,7 @@ bool IsMarketTrending()
     {
         string status = isTrending ? "TRENDING ✓" : "RANGING ✗";
         Print("MARKET REGIME: ", status, " (H1 EMA50/100 separation: ", 
-              DoubleToString(separationPercent, 4), "% | Threshold: 0.008%)");
+              DoubleToString(separationPercent, 4), "% | Threshold: 0.004%)");
         if(EnableTestMode)
         {
             Print("  EMA50[H1]: ", DoubleToString(ema50[0], 5), 
@@ -1382,17 +1386,40 @@ void CheckForEntry()
     bool priceAboveEMA = (currentPrice > emaValue[0]);
     bool priceBelowEMA = (currentPrice < emaValue[0]);
     
-    // RSI zones (mutually exclusive, balanced)
-    bool rsiInBuyZone = (rsiValue[0] >= 48 && rsiValue[0] <= 70);
-    bool rsiInSellZone = (rsiValue[0] >= 30 && rsiValue[0] <= 52);
+    // RSI zones (WIDENED: 45-75 buy, 25-55 sell for more opportunities)
+    bool rsiInBuyZone = (rsiValue[0] >= 45 && rsiValue[0] <= 75);
+    bool rsiInSellZone = (rsiValue[0] >= 25 && rsiValue[0] <= 55);
     
-    // Slope filter
-    bool emaSlopeOK = (emaSlope >= 0.00008);
+    // ===================================================================
+    // MATH UPGRADE: DYNAMIC SLOPE THRESHOLD USING ATR
+    // Old: Fixed 0.00008 (too strict on slow days)
+    // New: ATR(14) * 0.1 (adapts to market volatility)
+    // ===================================================================
+    double atrValue[];
+    ArraySetAsSeries(atrValue, true);
+    
+    double dynamicMinSlope = 0.00008;  // Fallback if ATR fails
+    
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrValue) == 1)
+    {
+        dynamicMinSlope = atrValue[0] * 0.1;  // 10% of ATR
+        if(EnableTestMode)
+        {
+            Print("ATR-based slope: ATR=", DoubleToString(atrValue[0], 5), 
+                  " | MinSlope=", DoubleToString(dynamicMinSlope, 6));
+        }
+    }
+    else
+    {
+        if(EnableTestMode) Print("⚠️ ATR read failed, using fallback slope: 0.00008");
+    }
+    
+    bool emaSlopeOK = (emaSlope >= dynamicMinSlope);
     
     // COMPLETE CONDITIONS for BUY
     bool buyCondition1 = priceAboveEMA;   // Price > EMA
     bool buyCondition2 = emaRising;       // EMA rising
-    bool buyCondition3 = rsiInBuyZone;    // RSI 48-70
+    bool buyCondition3 = rsiInBuyZone;    // RSI 45-75 (widened)
     bool buyCondition4 = emaSlopeOK;      // Slope >= 0.00008
     bool buyCondition5 = marketIsTrending;// Market trending
     
@@ -1401,7 +1428,7 @@ void CheckForEntry()
     // COMPLETE CONDITIONS for SELL
     bool sellCondition1 = priceBelowEMA;  // Price < EMA
     bool sellCondition2 = emaFalling;     // EMA falling
-    bool sellCondition3 = rsiInSellZone;  // RSI 30-52
+    bool sellCondition3 = rsiInSellZone;  // RSI 25-55 (widened)
     bool sellCondition4 = emaSlopeOK;     // Slope >= 0.00008
     bool sellCondition5 = marketIsTrending;// Market trending
     
@@ -1416,22 +1443,23 @@ void CheckForEntry()
         {
             Print("\n═══════════════════ SIGNAL CHECK ═══════════════════");
             Print("Price: ", DoubleToString(currentPrice, 5), " | EMA[H1]: ", DoubleToString(emaValue[0], 5));
-            Print("EMA Delta: ", DoubleToString(emaDelta, 6), " | Slope: ", DoubleToString(emaSlope, 6), " (min: 0.00008)");
+            Print("EMA Delta: ", DoubleToString(emaDelta, 6), " | Slope: ", DoubleToString(emaSlope, 6));
+            Print("Dynamic MinSlope: ", DoubleToString(dynamicMinSlope, 6), " (ATR-based)");
             Print("RSI: ", DoubleToString(rsiValue[0], 1));
             Print("Market: ", marketIsTrending ? "TRENDING ✓" : "RANGING ✗");
             Print("\n--- BUY CONDITIONS ---");
             Print("[1] Price > EMA: ", buyCondition1 ? "✓" : "✗", " (", currentPrice, " > ", emaValue[0], ")");
             Print("[2] EMA Rising: ", buyCondition2 ? "✓" : "✗", " (", emaDelta, ")");
-            Print("[3] RSI 48-70: ", buyCondition3 ? "✓" : "✗", " (RSI=", rsiValue[0], ")");
+            Print("[3] RSI 45-75: ", buyCondition3 ? "✓" : "✗", " (RSI=", rsiValue[0], ")");
             Print("[4] Slope OK: ", buyCondition4 ? "✓" : "✗");
             Print("[5] Trending: ", buyCondition5 ? "✓" : "✗");
             Print("BUY RESULT: ", allBuyConditions ? "✓ READY" : "✗ BLOCKED");
             Print("\n--- SELL CONDITIONS ---");
             Print("[1] Price < EMA: ", sellCondition1 ? "✓" : "✗", " (", currentPrice, " < ", emaValue[0], ")");
             Print("[2] EMA Falling: ", sellCondition2 ? "✓" : "✗", " (", emaDelta, ")");
-            Print("[3] RSI 30-52: ", sellCondition3 ? "✓" : "✗", " (RSI=", rsiValue[0], ")");
+            Print("[3] RSI 25-55: ", sellCondition3 ? "✓" : "✗", " (RSI=", rsiValue[0], ")");
             Print("[4] Slope OK: ", sellCondition4 ? "✓" : "✗");
-            Print("[5] Trending: ", sellCondition5 ? "✓" : "✗");
+            Print("[5] Trending: ", buyCondition5 ? "✓" : "✗");
             Print("SELL RESULT: ", allSellConditions ? "✓ READY" : "✗ BLOCKED");
             Print("════════════════════════════════════════════════════\n");
         }
@@ -1444,7 +1472,8 @@ void CheckForEntry()
         static datetime lastSlopeLog = 0;
         if(currentMinute != lastSlopeLog || EnableTestMode)
         {
-            Print("✗ EMA slope too flat: ", DoubleToString(emaSlope, 6), " < 0.00008 threshold");
+            Print("✗ EMA slope too flat: ", DoubleToString(emaSlope, 6), " < ", 
+                  DoubleToString(dynamicMinSlope, 6), " (ATR-based threshold)");
             lastSlopeLog = currentMinute;
         }
         IndicatorRelease(signalEmaHandle); // Clean up before return
