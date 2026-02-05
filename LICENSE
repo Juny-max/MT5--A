@@ -1,0 +1,225 @@
+PROPRIETARY COMMERCIAL SOFTWARE LICENSE
+
+Copyright (c) 2026 Junior Owusu. All Rights Reserved.
+
+================================================================================
+NOTICE: THIS SOFTWARE IS PROPRIETARY AND CONFIDENTIAL
+================================================================================
+
+This software and associated documentation files (the "Software") are the 
+exclusive property of Junior Owusu (the "Author") and are protected by 
+copyright law, international treaties, and other intellectual property rights.
+
+BY ACCESSING, VIEWING, OR DOWNLOADING THIS SOFTWARE, YOU ACKNOWLEDGE AND AGREE 
+TO BE BOUND BY THE TERMS OF THIS LICENSE. IF YOU DO NOT AGREE TO THESE TERMS, 
+YOU MUST IMMEDIATELY DELETE ALL COPIES OF THE SOFTWARE IN YOUR POSSESSION.
+
+================================================================================
+1. SOURCE AVAILABILITY AND PERMITTED USE
+================================================================================
+
+1.1 The Software is made publicly available on GitHub SOLELY for educational, 
+    academic, and portfolio demonstration purposes.
+
+1.2 You may view and study the source code for learning purposes only.
+
+1.3 NO OTHER RIGHTS ARE GRANTED. The availability of this source code does NOT 
+    constitute an open source license, nor does it grant any rights to use, 
+    execute, or benefit from the Software in any manner.
+
+================================================================================
+2. PROHIBITED USES - STRICT ENFORCEMENT
+================================================================================
+
+You are EXPRESSLY and STRICTLY PROHIBITED from:
+
+2.1 Compiling, building, or creating executable versions of this Software;
+
+2.2 Running, executing, or deploying this Software in any environment, including 
+    but not limited to: development environments, testing environments, demo 
+    accounts, live trading accounts, or any financial trading platform;
+
+2.3 Backtesting, forward testing, or conducting any form of performance analysis 
+    using this Software with real or simulated market data;
+
+2.4 Copying, reproducing, duplicating, or creating derivative works based on any 
+    part of this Software;
+
+2.5 Modifying, adapting, translating, or creating variations of this Software;
+
+2.6 Distributing, sublicensing, leasing, renting, lending, or transferring this 
+    Software or any portion thereof to any third party;
+
+2.7 Reverse engineering, decompiling, disassembling, or attempting to derive the 
+    source code logic for commercial advantage;
+
+2.8 Using this Software or any component thereof for commercial purposes, 
+    financial gain, or in any commercial product or service;
+
+2.9 Removing, altering, or obscuring any copyright notices, proprietary legends, 
+    or authorship attributions contained in the Software;
+
+2.10 Using the Software in any manner that competes with or diminishes the 
+     commercial value of the Author's proprietary interests.
+
+================================================================================
+3. OBTAINING A COMMERCIAL LICENSE
+================================================================================
+
+3.1 To obtain a LEGAL, AUTHORIZED license to use, execute, or deploy this 
+    Software for trading or any other practical purpose, you MUST:
+
+    a) Contact the Author at: [INSERT YOUR EMAIL ADDRESS]
+    b) Execute a separate commercial licensing agreement
+    c) Pay the required licensing fee as specified by the Author
+
+3.2 Only licensees who have executed a written commercial license agreement and 
+    paid all applicable fees are authorized to use this Software.
+
+3.3 No rights are granted under this public repository license except as 
+    explicitly stated in Section 1.
+
+================================================================================
+4. INTELLECTUAL PROPERTY PROTECTION
+================================================================================
+
+4.1 This Software contains valuable trade secrets, proprietary algorithms, and 
+    confidential business methodologies that constitute the Author's intellectual 
+    property.
+
+4.2 All rights, title, and interest in and to the Software, including all 
+    copyrights, trade secrets, patents, trademarks, and other intellectual 
+    property rights, are and shall remain the exclusive property of the Author.
+
+4.3 This license does NOT grant you any rights to use the Author's trademarks, 
+    service marks, trade names, or branding.
+
+================================================================================
+5. LEGAL ENFORCEMENT AND CONSEQUENCES
+================================================================================
+
+5.1 UNAUTHORIZED USE OF THIS SOFTWARE CONSTITUTES COPYRIGHT INFRINGEMENT, THEFT 
+    OF TRADE SECRETS, AND BREACH OF CONTRACT.
+
+5.2 The Author WILL pursue immediate legal action to the fullest extent of the 
+    law against any individual or entity that:
+    - Uses this Software without authorization
+    - Distributes or shares this Software
+    - Creates derivative works based on this Software
+    - Violates any provision of this license
+
+5.3 Legal remedies that WILL be pursued include, but are not limited to:
+    a) Injunctive relief to immediately cease unauthorized use
+    b) Monetary damages for all profits derived from unauthorized use
+    c) Statutory damages under applicable copyright laws
+    d) Compensation for theft of trade secrets under the Economic Espionage Act 
+       (18 U.S.C. § 1831) and applicable state laws
+    e) Attorney's fees and court costs
+    f) Criminal prosecution where applicable
+
+5.4 The Author reserves the right to seek damages equal to THREE TIMES (3x) the 
+    licensing fee for any unauthorized commercial use, or actual damages proven, 
+    whichever is greater.
+
+5.5 Violators will be held personally liable and may face criminal penalties 
+    including imprisonment under applicable intellectual property theft statutes.
+
+5.6 The Author actively monitors for unauthorized use and maintains evidence 
+    collection protocols for legal proceedings.
+
+================================================================================
+6. DISCLAIMER OF WARRANTIES
+================================================================================
+
+6.1 THIS SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT ANY WARRANTIES 
+    OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE 
+    IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR 
+    NON-INFRINGEMENT.
+
+6.2 The Author makes NO representation or warranty that:
+    a) The Software will be error-free or uninterrupted
+    b) The Software will produce any particular trading results or profits
+    c) The Software is suitable for any particular purpose
+    d) The use of the Software will not result in financial loss
+
+6.3 ALGORITHMIC TRADING INVOLVES SUBSTANTIAL RISK OF LOSS. The Author expressly 
+    disclaims any responsibility for trading losses, account depletion, or 
+    financial damages of any kind.
+
+================================================================================
+7. LIMITATION OF LIABILITY
+================================================================================
+
+7.1 IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
+    SPECIAL, CONSEQUENTIAL, OR EXEMPLARY DAMAGES (INCLUDING, BUT NOT LIMITED TO, 
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; 
+    OR BUSINESS INTERRUPTION; OR TRADING LOSSES) HOWEVER CAUSED AND ON ANY 
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF 
+    THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+7.2 Some jurisdictions do not allow the exclusion or limitation of incidental or 
+    consequential damages, so the above limitation may not apply to you.
+
+================================================================================
+8. TERMINATION
+================================================================================
+
+8.1 This license is effective until terminated.
+
+8.2 Your rights under this license will terminate automatically and immediately 
+    without notice if you fail to comply with any provision of this license.
+
+8.3 Upon termination, you must immediately destroy all copies of the Software in 
+    your possession or control and cease all use immediately.
+
+8.4 Sections 4, 5, 6, 7, 9, and 10 shall survive any termination of this license.
+
+================================================================================
+9. GOVERNING LAW AND JURISDICTION
+================================================================================
+
+9.1 This License shall be governed by and construed in accordance with the laws 
+    of [INSERT YOUR JURISDICTION/STATE/COUNTRY], without regard to its conflict 
+    of law provisions.
+
+9.2 Any legal action or proceeding arising under this License shall be brought 
+    exclusively in the courts located in [INSERT YOUR JURISDICTION], and the 
+    parties hereby consent to personal jurisdiction and venue therein.
+
+================================================================================
+10. ENTIRE AGREEMENT
+================================================================================
+
+10.1 This License constitutes the entire agreement between you and the Author 
+     concerning the Software and supersedes all prior or contemporaneous 
+     negotiations, discussions, or agreements regarding the subject matter.
+
+10.2 No amendment, modification, or waiver of any provision of this License 
+     shall be effective unless in writing and signed by the Author.
+
+10.3 If any provision of this License is held to be unenforceable or invalid, 
+     that provision shall be enforced to the maximum extent possible, and the 
+     other provisions shall remain in full force and effect.
+
+================================================================================
+CONTACT INFORMATION FOR LICENSING INQUIRIES
+================================================================================
+
+For authorized commercial licensing, contact:
+
+Author: Junior Owusu
+Email: [INSERT YOUR EMAIL ADDRESS]
+Website: [INSERT YOUR WEBSITE IF APPLICABLE]
+
+Do not use this Software until you have received written authorization from the 
+Author.
+
+================================================================================
+
+BY ACCESSING THIS SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS LICENSE, 
+UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS AND CONDITIONS.
+
+UNAUTHORIZED USE WILL BE PROSECUTED.
+
+================================================================================
