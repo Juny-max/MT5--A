@@ -425,6 +425,10 @@ input double MarginBufferPercent = 200.0;       // Free margin buffer after trad
 input int MinSecondsBetweenTrades = 120;        // Minimum seconds between trades (cooldown)
 input bool RequireManualResetAfterFloor = true; // Require manual reset after account floor hit
 input bool EmergencyStop = false;               // EMERGENCY KILL-SWITCH (manual override)
+input bool EnableNewsFilter = true;             // Enable economic calendar news filter
+input int NewsPauseMinutesBefore = 60;          // Minutes to pause before high-impact news
+input int NewsPauseMinutesAfter = 60;           // Minutes to pause after high-impact news
+input bool IncludeMediumImpact = false;         // Include medium impact news in filter
 
 input group "=== EMERGENCY PROTECTION ==="
 input double MaxEquityDrawdownPercent = 25.0;   // Max equity drawdown before emergency stop (%)
@@ -1064,6 +1068,12 @@ bool ShouldTrade()
         return false;
     }
     
+    // Check news filter (high-impact economic events)
+    if(EnableNewsFilter && IsNewsEvent())
+    {
+        return false;
+    }
+    
     return true;
 }
 
@@ -1284,7 +1294,7 @@ bool IsMarketTrending()
 }
 
 //+------------------------------------------------------------------+
-//| Check for entry signals - FIXED & ENHANCED                       |
+//| Check for entry signals - MULTI-TIMEFRAME FIX                    |
 //+------------------------------------------------------------------+
 void CheckForEntry()
 {
@@ -1324,19 +1334,37 @@ void CheckForEntry()
         return;
     }
     
+    // ===================================================================
+    // MULTI-TIMEFRAME FIX: Create LOCAL EMA handle for H1 data
+    // This prevents the "Failed to copy buffer" error when accessing
+    // H1 EMA data from an M5 chart
+    // ===================================================================
+    int signalEmaHandle = iMA(_Symbol, EMAPeriodTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    
+    if(signalEmaHandle == INVALID_HANDLE)
+    {
+        Print("⚠️ ERROR: Failed to create local EMA handle for ", EnumToString(EMAPeriodTF));
+        return;
+    }
+    
     // Get indicator values (EMA on H1, RSI on current chart)
     double emaValue[], rsiValue[];
     ArraySetAsSeries(emaValue, true);
     ArraySetAsSeries(rsiValue, true);
     
-    if(CopyBuffer(emaHandle, 0, 0, 2, emaValue) < 2)
+    // Use the LOCAL handle to fetch H1 EMA data
+    if(CopyBuffer(signalEmaHandle, 0, 0, 2, emaValue) < 2)
     {
-        if(EnableTestMode) Print("⚠️ Failed to copy EMA buffer");
+        if(EnableTestMode) Print("⚠️ Failed to copy EMA buffer from H1");
+        IndicatorRelease(signalEmaHandle); // Clean up before return
         return;
     }
+    
+    // RSI is on current timeframe - uses global handle (works fine)
     if(CopyBuffer(rsiHandle, 0, 0, 1, rsiValue) < 1)
     {
         if(EnableTestMode) Print("⚠️ Failed to copy RSI buffer");
+        IndicatorRelease(signalEmaHandle); // Clean up before return
         return;
     }
     
@@ -1419,6 +1447,7 @@ void CheckForEntry()
             Print("✗ EMA slope too flat: ", DoubleToString(emaSlope, 6), " < 0.00008 threshold");
             lastSlopeLog = currentMinute;
         }
+        IndicatorRelease(signalEmaHandle); // Clean up before return
         return;
     }
     
@@ -1438,6 +1467,7 @@ void CheckForEntry()
         Print("\n⚠️ DIRECTION CONFLICT: Both BUY and SELL signals active!");
         Print("Price: ", currentPrice, " | EMA: ", emaValue[0], " | RSI: ", rsiValue[0]);
         Print("NO TRADE - Waiting for clear direction\n");
+        IndicatorRelease(signalEmaHandle); // Clean up before return
         return;
     }
     else
@@ -1451,6 +1481,7 @@ void CheckForEntry()
             }
             lastNoSignalLog = currentMinute;
         }
+        IndicatorRelease(signalEmaHandle); // Clean up before return
         return;
     }
     
@@ -1485,6 +1516,11 @@ void CheckForEntry()
     
     // Mark this bar as used
     lastSignalBarTime = currentBarTime;
+    
+    // ===================================================================
+    // CRITICAL: Release the local EMA handle to prevent memory leaks
+    // ===================================================================
+    IndicatorRelease(signalEmaHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -2646,6 +2682,83 @@ void ActivateSoftRearm()
     
     // Note: We do NOT delete the global variable - it remains as a safety marker
     // Manual deletion is still required for full reset if user wants to exit ultra-conservative mode
+}
+
+// ECONOMIC CALENDAR NEWS FILTER
+//+------------------------------------------------------------------+
+//| Check if high-impact news event is scheduled within time window   |
+//| Uses native MQL5 CalendarValueHistory (no external requests)     |
+//+------------------------------------------------------------------+
+bool IsNewsEvent()
+{
+    // Define time window for news check
+    datetime currentTime = TimeCurrent();
+    datetime startTime = currentTime - (NewsPauseMinutesAfter * 60);
+    datetime endTime = currentTime + (NewsPauseMinutesBefore * 60);
+    
+    // Calendar value array
+    MqlCalendarValue values[];
+    
+    // Get all calendar events in the time window
+    if(CalendarValueHistory(values, startTime, endTime))
+    {
+        for(int i = 0; i < ArraySize(values); i++)
+        {
+            // Get event details
+            MqlCalendarEvent event;
+            if(!CalendarEventById(values[i].event_id, event))
+                continue;
+            
+            // Get country details
+            MqlCalendarCountry country;
+            if(!CalendarCountryById(event.country_id, country))
+                continue;
+            
+            // Filter for USD and EUR currencies only
+            string currencyCode = country.currency;
+            if(currencyCode != "USD" && currencyCode != "EUR")
+                continue;
+            
+            // Check impact level
+            ENUM_CALENDAR_EVENT_IMPORTANCE importance = event.importance;
+            
+            // High impact events
+            if(importance == CALENDAR_IMPORTANCE_HIGH)
+            {
+                datetime eventTime = values[i].time;
+                int minutesToEvent = (int)((eventTime - currentTime) / 60);
+                
+                Print("═══════════════════════════════════════════════════════════");
+                Print("⚠️ HIGH IMPACT NEWS DETECTED - TRADING PAUSED");
+                Print("Event: ", event.name);
+                Print("Currency: ", currencyCode);
+                Print("Time: ", TimeToString(eventTime, TIME_DATE|TIME_MINUTES));
+                Print("Minutes to event: ", minutesToEvent);
+                Print("═══════════════════════════════════════════════════════════");
+                
+                return true;
+            }
+            
+            // Medium impact events (if enabled)
+            if(IncludeMediumImpact && importance == CALENDAR_IMPORTANCE_MODERATE)
+            {
+                datetime eventTime = values[i].time;
+                int minutesToEvent = (int)((eventTime - currentTime) / 60);
+                
+                Print("═══════════════════════════════════════════════════════════");
+                Print("⚠️ MEDIUM IMPACT NEWS DETECTED - TRADING PAUSED");
+                Print("Event: ", event.name);
+                Print("Currency: ", currencyCode);
+                Print("Time: ", TimeToString(eventTime, TIME_DATE|TIME_MINUTES));
+                Print("Minutes to event: ", minutesToEvent);
+                Print("═══════════════════════════════════════════════════════════");
+                
+                return true;
+            }
+        }
+    }
+    
+    return false; // No high/medium impact news within time window
 }
 //+------------------------------------------------------------------+
 
