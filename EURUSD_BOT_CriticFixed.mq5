@@ -413,6 +413,12 @@ input double StopLossPips = 15.0;               // Stop loss (pips)
 input double TakeProfitPips = 20.0;             // Take profit (pips)
 input double MinLotSize = 0.01;                 // Minimum lot size
 
+input group "=== TRAILING STOP SETTINGS ==="
+input bool EnableTrailingStop = true;           // Enable trailing stop to lock profits
+input int TrailingStartPips = 15;               // Start trailing when profit > 15 pips
+input int TrailingDistPips = 5;                 // Keep Stop Loss 5 pips behind price
+input int TrailingStepPips = 5;                 // Only move SL if price moves 5+ pips
+
 input group "=== LOSS HANDLING ==="
 input int ConsecutiveLossLimit = 3;             // Max consecutive losses
 input int PauseAfterLossMinutes = 90;           // Pause after losses (min)
@@ -813,6 +819,7 @@ void OnTick()
     if(PositionSelect(_Symbol))
     {
         ManagePosition();
+        ApplyTrailingStop();  // Lock in profits with trailing stop
         return;
     }
     
@@ -2788,6 +2795,58 @@ bool IsNewsEvent()
     }
     
     return false; // No high/medium impact news within time window
+}
+
+//+------------------------------------------------------------------+
+//| Manage Trailing Stop (Locks in profit)                          |
+//+------------------------------------------------------------------+
+void ApplyTrailingStop()
+{
+    if(!EnableTrailingStop) return;
+    if(!PositionSelect(_Symbol)) return;
+    
+    // Get current details
+    double currentSL = PositionGetDouble(POSITION_SL);
+    double currentTP = PositionGetDouble(POSITION_TP);
+    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+    long type = PositionGetInteger(POSITION_TYPE);
+    
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double pipSize = (digits == 3 || digits == 5) ? point * 10 : point;
+    
+    // BUY POSITION LOGIC
+    if(type == POSITION_TYPE_BUY)
+    {
+        double profitPips = (currentPrice - openPrice) / pipSize;
+        if(profitPips > TrailingStartPips)
+        {
+            double newSL = currentPrice - (TrailingDistPips * pipSize);
+            if(newSL > (currentSL + (TrailingStepPips * pipSize)))
+            {
+                newSL = NormalizeDouble(newSL, digits);
+                trade.PositionModify(PositionGetInteger(POSITION_TICKET), newSL, currentTP);
+                Print("✓ TRAIL: Moving Buy SL to ", newSL, " (Locked Profit: +", DoubleToString(profitPips, 1), " pips)");
+            }
+        }
+    }
+    
+    // SELL POSITION LOGIC
+    if(type == POSITION_TYPE_SELL)
+    {
+        double profitPips = (openPrice - currentPrice) / pipSize;
+        if(profitPips > TrailingStartPips)
+        {
+            double newSL = currentPrice + (TrailingDistPips * pipSize);
+            if(currentSL == 0 || newSL < (currentSL - (TrailingStepPips * pipSize)))
+            {
+                newSL = NormalizeDouble(newSL, digits);
+                trade.PositionModify(PositionGetInteger(POSITION_TICKET), newSL, currentTP);
+                Print("✓ TRAIL: Moving Sell SL to ", newSL, " (Locked Profit: +", DoubleToString(profitPips, 1), " pips)");
+            }
+        }
+    }
 }
 //+------------------------------------------------------------------+
 
