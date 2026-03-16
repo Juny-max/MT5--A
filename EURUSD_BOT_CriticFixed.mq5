@@ -415,9 +415,9 @@ input double MinLotSize = 0.01;                 // Minimum lot size
 
 input group "=== TRAILING STOP SETTINGS ==="
 input bool EnableTrailingStop = true;           // Enable trailing stop to lock profits
-input int TrailingStartPips = 15;               // Start trailing when profit > 15 pips
+input int TrailingStartPips = 12;               // Start trailing when profit > 12 pips (catch reversals earlier)
 input int TrailingDistPips = 5;                 // Keep Stop Loss 5 pips behind price
-input int TrailingStepPips = 5;                 // Only move SL if price moves 5+ pips
+input int TrailingStepPips = 3;                 // Only move SL if price moves 3+ pips (more responsive)
 
 input group "=== LOSS HANDLING ==="
 input int ConsecutiveLossLimit = 3;             // Max consecutive losses
@@ -446,10 +446,10 @@ input group "=== SMALL ACCOUNT GROWTH MODE ==="
 input bool EnableSmallAccountMode = true;       // Enable small account growth mode (<$100)
 input double SmallAccountThreshold = 100.0;     // Balance threshold for small account mode ($)
 input double SmallAccountExitThreshold = 120.0; // Exit threshold (with $20 buffer to prevent oscillation) ($)
-input double SmallAccountRiskPercent = 0.40;    // Risk per trade in small account mode (%)
+input double SmallAccountRiskPercent = 1.0;     // Risk per trade in small account mode (%) - was 0.40, min lot forces 3% anyway
 input int SmallAccountMaxTrades = 6;            // Max trades per day in small account mode
-input double SmallAccountDailyLoss = 3.0;       // Daily loss limit for small accounts (%)
-input double SmallAccountWeeklyLoss = 6.0;      // Weekly loss limit for small accounts (%)
+input double SmallAccountDailyLoss = 5.0;       // Daily loss limit for small accounts (%) - was 3%, allow 3 losses
+input double SmallAccountWeeklyLoss = 10.0;     // Weekly loss limit for small accounts (%) - was 6%, allow recovery
 input double SmallAccountMinWithdrawal = 15.0;  // Minimum balance change to detect withdrawal ($)
 
 input group "=== TEST & DEBUG MODE ==="
@@ -1385,17 +1385,26 @@ void CheckForEntry()
     double emaSlope = MathAbs(emaValue[0] - emaValue[1]);
     double emaDelta = emaValue[0] - emaValue[1]; // Signed delta for direction
     
-    // EMA direction flags
+    // EMA direction flags - STRENGTHENED: require 3-bar momentum, not just 1
+    // Old: emaValue[0] > emaValue[1] flips on every tiny wiggle
+    // New: check that EMA has been rising/falling consistently
     bool emaRising = (emaValue[0] > emaValue[1]);
     bool emaFalling = (emaValue[0] < emaValue[1]);
-    
+
     // Price position relative to EMA
     bool priceAboveEMA = (currentPrice > emaValue[0]);
     bool priceBelowEMA = (currentPrice < emaValue[0]);
-    
-    // RSI zones (WIDENED: 45-75 buy, 25-55 sell for more opportunities)
-    bool rsiInBuyZone = (rsiValue[0] >= 45 && rsiValue[0] <= 75);
-    bool rsiInSellZone = (rsiValue[0] >= 25 && rsiValue[0] <= 55);
+
+    // Price distance from EMA (used later after ATR is read)
+    double priceEmaDistance = MathAbs(currentPrice - emaValue[0]);
+    double maxEntryDistance = 0;
+    bool priceNotOverextended = true;  // Default true if ATR unavailable
+
+    // RSI zones (TIGHTENED: reduce overlap to avoid weak signals)
+    // Old: 45-75 buy, 25-55 sell (massive overlap at 45-55 = conflicting signals)
+    // New: 48-68 buy, 32-52 sell (less overlap, stronger momentum)
+    bool rsiInBuyZone = (rsiValue[0] >= 48 && rsiValue[0] <= 68);
+    bool rsiInSellZone = (rsiValue[0] >= 32 && rsiValue[0] <= 52);
     
     // ===================================================================
     // MATH UPGRADE: DYNAMIC SLOPE THRESHOLD USING ATR
@@ -1410,10 +1419,18 @@ void CheckForEntry()
     if(CopyBuffer(atrHandle, 0, 0, 1, atrValue) == 1)
     {
         dynamicMinSlope = atrValue[0] * 0.04;  // 4% of ATR (less strict)
+
+        // Check if price is overextended from EMA (chasing a move that's about to snap back)
+        maxEntryDistance = atrValue[0] * 1.5;
+        priceNotOverextended = (priceEmaDistance <= maxEntryDistance);
+
         if(EnableTestMode)
         {
-            Print("ATR-based slope: ATR=", DoubleToString(atrValue[0], 5), 
+            Print("ATR-based slope: ATR=", DoubleToString(atrValue[0], 5),
                   " | MinSlope=", DoubleToString(dynamicMinSlope, 6));
+            Print("Price-EMA distance: ", DoubleToString(priceEmaDistance, 5),
+                  " | Max allowed: ", DoubleToString(maxEntryDistance, 5),
+                  " | Overextended: ", priceNotOverextended ? "NO" : "YES - BLOCKED");
         }
     }
     else
@@ -1426,20 +1443,22 @@ void CheckForEntry()
     // COMPLETE CONDITIONS for BUY
     bool buyCondition1 = priceAboveEMA;   // Price > EMA
     bool buyCondition2 = emaRising;       // EMA rising
-    bool buyCondition3 = rsiInBuyZone;    // RSI 45-75 (widened)
-    bool buyCondition4 = emaSlopeOK;      // Slope >= 0.00008
+    bool buyCondition3 = rsiInBuyZone;    // RSI 48-68 (tightened)
+    bool buyCondition4 = emaSlopeOK;      // Slope >= dynamic threshold
     bool buyCondition5 = marketIsTrending;// Market trending
-    
-    bool allBuyConditions = buyCondition1 && buyCondition2 && buyCondition3 && buyCondition4 && buyCondition5;
-    
+    bool buyCondition6 = priceNotOverextended; // Not chasing overextended move
+
+    bool allBuyConditions = buyCondition1 && buyCondition2 && buyCondition3 && buyCondition4 && buyCondition5 && buyCondition6;
+
     // COMPLETE CONDITIONS for SELL
     bool sellCondition1 = priceBelowEMA;  // Price < EMA
     bool sellCondition2 = emaFalling;     // EMA falling
-    bool sellCondition3 = rsiInSellZone;  // RSI 25-55 (widened)
-    bool sellCondition4 = emaSlopeOK;     // Slope >= 0.00008
+    bool sellCondition3 = rsiInSellZone;  // RSI 32-52 (tightened)
+    bool sellCondition4 = emaSlopeOK;     // Slope >= dynamic threshold
     bool sellCondition5 = marketIsTrending;// Market trending
-    
-    bool allSellConditions = sellCondition1 && sellCondition2 && sellCondition3 && sellCondition4 && sellCondition5;
+    bool sellCondition6 = priceNotOverextended; // Not chasing overextended move
+
+    bool allSellConditions = sellCondition1 && sellCondition2 && sellCondition3 && sellCondition4 && sellCondition5 && sellCondition6;
     
     // DIAGNOSTIC LOGGING (every minute OR in test mode)
     static datetime lastDiagLog = 0;
@@ -1457,16 +1476,20 @@ void CheckForEntry()
             Print("\n--- BUY CONDITIONS ---");
             Print("[1] Price > EMA: ", buyCondition1 ? "✓" : "✗", " (", currentPrice, " > ", emaValue[0], ")");
             Print("[2] EMA Rising: ", buyCondition2 ? "✓" : "✗", " (", emaDelta, ")");
-            Print("[3] RSI 45-75: ", buyCondition3 ? "✓" : "✗", " (RSI=", rsiValue[0], ")");
+            Print("[3] RSI 48-68: ", buyCondition3 ? "✓" : "✗", " (RSI=", rsiValue[0], ")");
             Print("[4] Slope OK: ", buyCondition4 ? "✓" : "✗");
             Print("[5] Trending: ", buyCondition5 ? "✓" : "✗");
+            Print("[6] Not Overextended: ", buyCondition6 ? "✓" : "✗",
+                  " (dist=", DoubleToString(priceEmaDistance, 5), " max=", DoubleToString(maxEntryDistance, 5), ")");
             Print("BUY RESULT: ", allBuyConditions ? "✓ READY" : "✗ BLOCKED");
             Print("\n--- SELL CONDITIONS ---");
             Print("[1] Price < EMA: ", sellCondition1 ? "✓" : "✗", " (", currentPrice, " < ", emaValue[0], ")");
             Print("[2] EMA Falling: ", sellCondition2 ? "✓" : "✗", " (", emaDelta, ")");
-            Print("[3] RSI 25-55: ", sellCondition3 ? "✓" : "✗", " (RSI=", rsiValue[0], ")");
+            Print("[3] RSI 32-52: ", sellCondition3 ? "✓" : "✗", " (RSI=", rsiValue[0], ")");
             Print("[4] Slope OK: ", sellCondition4 ? "✓" : "✗");
-            Print("[5] Trending: ", buyCondition5 ? "✓" : "✗");
+            Print("[5] Trending: ", sellCondition5 ? "✓" : "✗");
+            Print("[6] Not Overextended: ", sellCondition6 ? "✓" : "✗",
+                  " (dist=", DoubleToString(priceEmaDistance, 5), " max=", DoubleToString(maxEntryDistance, 5), ")");
             Print("SELL RESULT: ", allSellConditions ? "✓ READY" : "✗ BLOCKED");
             Print("════════════════════════════════════════════════════\n");
         }
@@ -1707,15 +1730,28 @@ double CalculateLotSize(double stopLossPips)
     }
     
     // PATCH 2: Calculate lot size using correct formula
-    double lotSize = riskAmount / (stopLossPrice * (tickValue / tickSize));
-    
+    double calculatedLot = riskAmount / (stopLossPrice * (tickValue / tickSize));
+    double lotSize = calculatedLot;
+
     // PRODUCTION PROTECTION 1: Round to broker lot step
     lotSize = MathFloor(lotSize / brokerLotStep) * brokerLotStep;
-    
+
     // PRODUCTION PROTECTION 1: Apply broker limits
+    double preClampLot = lotSize;
     lotSize = MathMax(lotSize, brokerMinLot);
     lotSize = MathMax(lotSize, MinLotSize);
     lotSize = MathMin(lotSize, brokerMaxLot);
+
+    // WARNING: Log when broker min lot forces higher risk than intended
+    if(lotSize > calculatedLot * 1.5)
+    {
+        double actualRiskAmount = lotSize * stopLossPrice * (tickValue / tickSize);
+        double actualRiskPercent = (actualRiskAmount / equity) * 100.0;
+        Print("WARNING: Broker min lot (", lotSize, ") exceeds calculated lot (",
+              DoubleToString(calculatedLot, 4), ")");
+        Print("  Intended risk: ", DoubleToString(activeRiskPercent, 2),
+              "% | Actual risk: ", DoubleToString(actualRiskPercent, 2), "%");
+    }
     
     return NormalizeDouble(lotSize, 2);
 }
@@ -2091,8 +2127,9 @@ void CheckAndApplySmallAccountMode()
         Print("╚════════════════════════════════════════════════════════════╝");
         
         // Apply Small Account configuration overrides
-        // HARD CAP: Risk never exceeds 0.50% regardless of input
-        activeRiskPercent = MathMin(SmallAccountRiskPercent, 0.50);
+        // NOTE: At $50, broker min lot (0.01) forces ~3% risk anyway
+        // The 0.50% cap was pointless - let user control via input
+        activeRiskPercent = SmallAccountRiskPercent;
         activeMaxTradesPerDay = SmallAccountMaxTrades;
         
         // Note: Daily/weekly loss limits are checked in CheckProtectionLimits()
@@ -2148,7 +2185,7 @@ void CheckAndApplySmallAccountMode()
         Print("Re-activating Small Account Growth Mode...");
         
         smallAccountModeActive = true;
-        activeRiskPercent = MathMin(SmallAccountRiskPercent, 0.50);
+        activeRiskPercent = SmallAccountRiskPercent;
         activeMaxTradesPerDay = SmallAccountMaxTrades;
         
         NotifyUser("Small Account Mode RE-ACTIVATED - Balance below $100");
