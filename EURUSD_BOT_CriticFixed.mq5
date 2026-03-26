@@ -1,1048 +1,1251 @@
 //+------------------------------------------------------------------+
-//|  EURUSD_CapitalPreservation.mq5  —  PATCH SET v2.0             |
-//|  Target Platform: Exness Standard Cent Account (USC)            |
-//|                                                                  |
-//|  *** SURGICAL PATCH FILE — DROP-IN REPLACEMENTS ***             |
-//|  Each section below is a self-contained replacement.           |
-//|  Search for the original function name and swap it out.        |
+//|                            Guardian_EURUSD_v2.mq5                |
+//|           Capital Preservation EA — Patched & Fully Merged       |
+//|  PATCH SET v2 INTEGRATED:                                        |
+//|   P1: USC-safe lot sizing, strict floor() truncation, hard abort |
+//|   P2: 30-period CMI regime detection (SWING vs TREND)           |
+//|   P3: M1 microtrading layer (4-indicator confluence) for TREND   |
 //+------------------------------------------------------------------+
-//
-//  PATCH SUMMARY
-//  =============
-//  PATCH 1 : CalculateLotSize()
-//             — USC-aware risk math (no hard USD references)
-//             — Strict MathFloor() downward truncation
-//             — Hard abort if lot < SYMBOL_VOLUME_MIN (no silent fallback)
-//             — 0.50% hard cap enforced INSIDE the function
-//
-//  PATCH 2 : CalculateCMI()          [NEW FUNCTION]
-//             — 30-period Choppy Market Index on current chart TF
-//             — Returns double in range [0, 100]
-//
-//  PATCH 3 : CheckForEntry()
-//             — Deprecates static 0.03% EMA separation filter
-//             — Deprecates hard-coded 0.00015 EMA slope threshold
-//             — Integrates CMI regime switching (Swing vs Trend)
-//             — For TREND regime: chains M1 microtrading layer
-//
-//  PATCH 4 : GetM1MicrotradingSignal()  [NEW FUNCTION]
-//             — Four-indicator confluence on M1 for precise entries
-//             — EBB midline (EMA-18 M1), EMA-3 M1, MACD hist, RSI(14)
-//             — Returns  1 = BUY,  -1 = SELL,  0 = NO SIGNAL
-//
-//  PATCH 5 : InitializeMicrotradingIndicators()  [NEW FUNCTION]
-//             — Creates all four M1 indicator handles
-//             — Call this at the END of OnInit() before return
-//
-//  PATCH 6 : DeinitMicrotradingIndicators()  [NEW FUNCTION]
-//             — Releases M1 handles cleanly
-//             — Call this at the START of OnDeinit()
-//
-// =================================================================
-// HOW TO APPLY
-// =================================================================
-//  1. Open EURUSD_CapitalPreservation.mq5 in MetaEditor.
-//  2. Add the NEW GLOBAL VARIABLES block (Section A) to your
-//     global variables section, near the existing indicator handles.
-//  3. Find each original function listed below and replace it
-//     entirely with the patched version from this file.
-//  4. Add the two OnInit / OnDeinit call sites as noted.
-//  5. Compile — zero new warnings expected.
-// =================================================================
+#property copyright "Capital Preservation Scalper v2.0"
+#property link      ""
+#property version   "2.00"
+#property strict
 
+#include <Trade\Trade.mqh>
 
-// =================================================================
-// SECTION A — NEW GLOBAL VARIABLES
-// (Add these near the existing indicator handles, e.g. after line 486)
-// =================================================================
+//=== INPUT PARAMETERS ==============================================
 
-/*
-//--- CMI Regime State (Patch 2)
-string g_marketRegime    = "UNDEFINED"; // "SWING" | "TREND" | "UNDEFINED"
-double g_lastCMI         = 0.0;        // Last computed CMI value (for diagnostics)
-datetime g_lastCMILog    = 0;          // Rate-limiter for CMI log spam
+input group "=== BASIC SETTINGS ==="
+input int    MagicNumber               = 100501;
+input string TradeComment              = "CapPreserve";
 
-//--- M1 Microtrading Indicator Handles (Patch 3 / 4)
-int g_m1_ema18Handle  = INVALID_HANDLE; // EBB midline: EMA(18) on M1 — exponential BB midline
-int g_m1_ema3Handle   = INVALID_HANDLE; // Fast signal: EMA(3)  on M1
-int g_m1_macdHandle   = INVALID_HANDLE; // MACD (12, 26, 9)     on M1
-int g_m1_rsi14Handle  = INVALID_HANDLE; // RSI (14)             on M1
-*/
+input group "=== RISK MANAGEMENT ==="
+input double RiskPercentPerTrade       = 1.0;
+input int    MaxTradesPerDay           = 8;
+input double MaxDailyLossPercent       = 2.0;
+input double MaxWeeklyLossPercent      = 5.0;
+input double WeeklyProfitTargetPercent = 3.0;
 
+input group "=== EQUITY RANGE ALERT ==="
+input double MinEquityRange            = 10.0;
+input double MaxEquityRange            = 500.0;
 
-// =================================================================
-// SECTION B — OnInit() ADDITION
-// (Add this block just before "return INIT_SUCCEEDED;" in OnInit)
-// =================================================================
+input group "=== WITHDRAWAL DETECTION ==="
+input double WithdrawalThresholdPercent= 25.0;
 
-/*
-    //--- PATCH 3: Initialize M1 microtrading indicator layer
-    if(!InitializeMicrotradingIndicators())
-    {
-        // Non-fatal if M1 data is not yet warmed up; EA will fall back
-        // to Swing-regime logic only until handles become valid.
-        Print("⚠️ PATCH3: M1 indicator init deferred (data not ready). "
-              "Trend entries temporarily disabled.");
-    }
-*/
+input group "=== SPREAD FILTERS ==="
+input int    PreferredSpreadPoints     = 15;
+input int    MaxSpreadPoints           = 25;
+input int    MaxAllowedSpreadPoints    = 30;
+input int    HighSpreadMinutes         = 15;
+input int    SpreadPauseMinutes        = 60;
 
+input group "=== STRATEGY SETTINGS ==="
+input ENUM_TIMEFRAMES EMAPeriodTF      = PERIOD_H1;
+input int    EMAPeriod                 = 100;
+input int    RSIPeriod                 = 14;
+input int    RSIOverbought             = 70;
+input int    RSIOversold               = 30;
 
-// =================================================================
-// SECTION C — OnDeinit() ADDITION
-// (Add as the very first line inside OnDeinit, before existing releases)
-// =================================================================
+input group "=== POSITION SIZING ==="
+input double StopLossPips              = 15.0;
+input double TakeProfitPips            = 20.0;
+input double MinLotSize                = 0.01;
 
-/*
-    DeinitMicrotradingIndicators(); // PATCH 3: release M1 handles
-*/
+input group "=== TRAILING STOP SETTINGS ==="
+input bool   EnableTrailingStop        = true;
+input int    TrailingStartPips         = 12;
+input int    TrailingDistPips          = 5;
+input int    TrailingStepPips          = 3;
 
+input group "=== LOSS HANDLING ==="
+input int    ConsecutiveLossLimit      = 3;
+input int    PauseAfterLossMinutes     = 90;
 
-// =================================================================
-// PATCH 5 — InitializeMicrotradingIndicators()
-//            NEW FUNCTION — insert anywhere before CheckForEntry()
-// =================================================================
+input group "=== EXECUTION SAFETY ==="
+input double MinFreeMarginPercent      = 150.0;
+input int    TargetStabilityMinutes    = 5;
+input int    MaxSlippagePoints         = 5;
+input double MarginBufferPercent       = 200.0;
+input int    MinSecondsBetweenTrades   = 120;
+input bool   RequireManualResetAfterFloor = true;
+input bool   EmergencyStop             = false;
+input bool   EnableNewsFilter          = true;
+input int    NewsPauseMinutesBefore    = 60;
+input int    NewsPauseMinutesAfter     = 60;
+input bool   IncludeMediumImpact       = false;
 
-//+------------------------------------------------------------------+
-//| Create and validate all four M1 microtrading indicator handles   |
-//| Returns: true  = all handles valid                               |
-//|          false = one or more handles failed (non-fatal)          |
-//+------------------------------------------------------------------+
-bool InitializeMicrotradingIndicators()
+input group "=== EMERGENCY PROTECTION ==="
+input double MaxEquityDrawdownPercent  = 25.0;
+input int    MaxConsecutiveErrors      = 5;
+input bool   SoftRearmAllowed          = true;
+input int    SoftRearmCooldownMinutes  = 30;
+
+input group "=== SMALL ACCOUNT GROWTH MODE ==="
+input bool   EnableSmallAccountMode    = true;
+input double SmallAccountThreshold     = 100.0;
+input double SmallAccountExitThreshold = 120.0;
+input double SmallAccountRiskPercent   = 1.0;
+input int    SmallAccountMaxTrades     = 6;
+input double SmallAccountDailyLoss     = 5.0;
+input double SmallAccountWeeklyLoss    = 10.0;
+input double SmallAccountMinWithdrawal = 15.0;
+
+input group "=== TEST AND DEBUG MODE ==="
+input bool   EnableTestMode            = false;
+input bool   DisableTrendFilter        = false;
+input bool   ShowAllConditions         = true;
+
+//=== GLOBAL VARIABLES ==============================================
+
+CTrade   trade;
+datetime lastTradeTime         = 0;
+datetime pauseUntil            = 0;
+datetime weeklyResetTime       = 0;
+datetime dailyResetTime        = 0;
+
+int      consecutiveLosses     = 0;
+int      tradesThisDay         = 0;
+double   dailyStartBalance     = 0;
+double   weeklyStartBalance    = 0;
+double   lastKnownBalance      = 0;
+
+bool     weeklyTargetReached   = false;
+bool     dailyLossHit          = false;
+bool     weeklyLossHit         = false;
+bool     conservativeMode      = false;
+
+double   activeRiskPercent     = 0;
+int      activeMaxTradesPerDay = 0;
+
+int      highSpreadCounter     = 0;
+datetime lastSpreadCheck       = 0;
+
+int      emaHandle             = INVALID_HANDLE;
+int      rsiHandle             = INVALID_HANDLE;
+int      atrHandle             = INVALID_HANDLE;
+
+datetime lastHistoryCheck      = 0;
+int      lastHistoryTotal      = 0;
+datetime weeklyTargetReachedTime = 0;
+datetime lastOrderAttempt      = 0;
+
+double   conservativeModeThreshold = 0;
+
+int      lastSpread            = 0;
+datetime spreadSpikeDetectedTime = 0;
+bool     accountFloorHit       = false;
+datetime lastDiagnosticPrint   = 0;
+
+int      brokerStopsLevel      = 0;
+int      brokerFreezeLevel     = 0;
+double   brokerMinLot          = 0;
+double   brokerMaxLot          = 0;
+double   brokerLotStep         = 0;
+double   adaptedStopLoss       = 0;
+double   adaptedTakeProfit     = 0;
+
+bool     emergencyStopActive   = false;
+double   initialEquity         = 0;
+int      consecutiveErrors     = 0;
+datetime lastErrorTime         = 0;
+
+bool     softRearmActive       = false;
+datetime accountFloorHitTime   = 0;
+bool     ultraConservativeMode = false;
+
+bool     smallAccountModeActive = false;
+double   originalRiskPercent   = 0;
+int      originalMaxTrades     = 0;
+double   originalDailyLoss     = 0;
+double   originalWeeklyLoss    = 0;
+datetime lastSmallAccountCheck = 0;
+
+// PATCH 2: CMI regime state
+string   g_marketRegime        = "UNDEFINED";
+double   g_lastCMI             = 0.0;
+datetime g_lastCMILog          = 0;
+
+// PATCH 3: M1 microtrading indicator handles
+int      g_m1_ema18Handle      = INVALID_HANDLE;
+int      g_m1_ema3Handle       = INVALID_HANDLE;
+int      g_m1_macdHandle       = INVALID_HANDLE;
+int      g_m1_rsi14Handle      = INVALID_HANDLE;
+
+//=== UTILITY FUNCTION PROTOTYPES (forward declarations) ===========
+datetime GetDayStart();
+datetime GetWeekStart();
+datetime GetCurrentMinute();
+void     NotifyUser(string message);
+double   GetEffectiveDailyLossLimit();
+double   GetEffectiveWeeklyLossLimit();
+double   GetEffectiveMinWithdrawal();
+void     CheckAndApplySmallAccountMode();
+void     CheckProtectionLimits();
+void     RecordExecutionError();
+void     ActivateEmergencyStop(string reason);
+bool     InitializeMicrotradingIndicators();
+void     DeinitMicrotradingIndicators();
+double   CalculateCMI();
+int      GetM1MicrotradingSignal();
+void     CheckSoftRearmConditions();
+void     ActivateSoftRearm();
+
+//=== ONINIT ========================================================
+
+int OnInit()
 {
-    //--- Minimum M1 bars needed: max lookback of the slowest indicator
-    //    MACD slow EMA = 26 bars, signal = 9 bars → need >= 35 M1 bars
-    int m1Bars = Bars(_Symbol, PERIOD_M1);
-    if(m1Bars < 50)
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetDeviationInPoints(MaxSlippagePoints);
+    trade.SetTypeFilling(ORDER_FILLING_IOC);
+    trade.SetAsyncMode(false);
+
+    ENUM_TIMEFRAMES tf = _Period;
+    if(tf < PERIOD_M5)
     {
-        Print("⚠️ PATCH3-INIT: Only ", m1Bars, " M1 bars available. Need 50. Deferring.");
-        return false;
+        Alert("CRITICAL: Run on M5 or higher. Current: ", EnumToString(tf));
+        return INIT_FAILED;
+    }
+    if(tf != PERIOD_M5)
+        Print("NOTE: Optimised for M5. Current: ", EnumToString(tf));
+    Print("EA Timeframe: ", EnumToString(tf));
+
+    if(StringFind(_Symbol, "EURUSD") < 0)
+    {
+        Alert("ERROR: EURUSD only. Symbol: ", _Symbol);
+        return INIT_FAILED;
     }
 
-    //--- EBB Midline: EMA(18) on M1
-    //    The "Exponential Bollinger Band midline" IS the EMA itself.
-    //    Upper/Lower bands are not required for the crossover signal.
-    g_m1_ema18Handle = iMA(_Symbol, PERIOD_M1, 18, 0, MODE_EMA, PRICE_CLOSE);
-    if(g_m1_ema18Handle == INVALID_HANDLE)
+    Print("========== BROKER AUTO-ADAPTATION ==========");
+    brokerStopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    brokerFreezeLevel= (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+
+    long execMode = 0;
+    if(!SymbolInfoInteger(_Symbol, SYMBOL_TRADE_EXEMODE, execMode))
+        execMode = SYMBOL_TRADE_EXECUTION_MARKET;
+
+    brokerMinLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    brokerMaxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    brokerLotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+    double point    = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    int    digits   = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double pipValue = (digits == 3 || digits == 5) ? point * 10.0 : point;
+
+    Print("Vol Min:", brokerMinLot, " Max:", brokerMaxLot, " Step:", brokerLotStep);
+
+    double minStopPips = (brokerStopsLevel * point) / pipValue;
+    adaptedStopLoss    = StopLossPips;
+    adaptedTakeProfit  = TakeProfitPips;
+
+    if(StopLossPips < minStopPips)
     {
-        Print("❌ PATCH3-INIT: Failed to create EMA-18 M1 handle. Error: ", GetLastError());
-        return false;
+        adaptedStopLoss = minStopPips + 2.0;
+        Alert("SL adapted to ", adaptedStopLoss, " pips");
+    }
+    if(TakeProfitPips < minStopPips)
+    {
+        adaptedTakeProfit = minStopPips + 2.0;
+        Alert("TP adapted to ", adaptedTakeProfit, " pips");
     }
 
-    //--- Fast Signal EMA: EMA(3) on M1
-    g_m1_ema3Handle = iMA(_Symbol, PERIOD_M1, 3, 0, MODE_EMA, PRICE_CLOSE);
-    if(g_m1_ema3Handle == INVALID_HANDLE)
+    if(brokerMinLot <= 0 || brokerMaxLot <= 0 || brokerLotStep <= 0)
     {
-        Print("❌ PATCH3-INIT: Failed to create EMA-3 M1 handle. Error: ", GetLastError());
-        IndicatorRelease(g_m1_ema18Handle);
-        g_m1_ema18Handle = INVALID_HANDLE;
-        return false;
+        Alert("CRITICAL: Invalid volume params Min:", brokerMinLot, " Max:", brokerMaxLot);
+        return INIT_FAILED;
+    }
+    Print("Adapted SL:", adaptedStopLoss, " TP:", adaptedTakeProfit);
+    Print("============================================");
+
+    if(!SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE))
+    { Alert("ERROR: ", _Symbol, " trading disabled."); return INIT_FAILED; }
+
+    if(!SymbolInfoInteger(_Symbol, SYMBOL_SELECT))
+    {
+        if(!SymbolSelect(_Symbol, true))
+        { Alert("ERROR: Cannot select ", _Symbol); return INIT_FAILED; }
     }
 
-    //--- MACD (12, 26, 9) on M1
-    //    Buffer 0 = MACD main line, Buffer 1 = Signal line
-    //    Histogram is computed as: macd[0] - signal[0]
-    g_m1_macdHandle = iMACD(_Symbol, PERIOD_M1, 12, 26, 9, PRICE_CLOSE);
-    if(g_m1_macdHandle == INVALID_HANDLE)
+    int fillMode = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+    if((fillMode & SYMBOL_FILLING_IOC) == 0)
     {
-        Print("❌ PATCH3-INIT: Failed to create MACD M1 handle. Error: ", GetLastError());
-        IndicatorRelease(g_m1_ema18Handle);
-        IndicatorRelease(g_m1_ema3Handle);
-        g_m1_ema18Handle = INVALID_HANDLE;
-        g_m1_ema3Handle  = INVALID_HANDLE;
-        return false;
+        Alert("WARNING: IOC unsupported — using FOK.");
+        trade.SetTypeFilling(ORDER_FILLING_FOK);
     }
 
-    //--- RSI(14) on M1
-    g_m1_rsi14Handle = iRSI(_Symbol, PERIOD_M1, 14, PRICE_CLOSE);
-    if(g_m1_rsi14Handle == INVALID_HANDLE)
+    int bars = Bars(_Symbol, EMAPeriodTF);
+    if(bars < EMAPeriod + 10)
+    { Alert("ERROR: Insufficient history (", bars, " bars)."); return INIT_FAILED; }
+
+    double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickVal <= 0 || tickSize <= 0)
+    { Alert("ERROR: Bad tick params."); return INIT_FAILED; }
+
+    emaHandle = iMA(_Symbol, EMAPeriodTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RSIPeriod, PRICE_CLOSE);
+    atrHandle = iATR(_Symbol, PERIOD_H1, 14);
+
+    if(emaHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE || atrHandle == INVALID_HANDLE)
+    { Print("ERROR: Core indicator handles failed."); return INIT_FAILED; }
+
+    dailyStartBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
+    weeklyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    lastKnownBalance   = AccountInfoDouble(ACCOUNT_BALANCE);
+    dailyResetTime     = GetDayStart();
+    weeklyResetTime    = GetWeekStart();
+    initialEquity      = AccountInfoDouble(ACCOUNT_EQUITY);
+
+    HistorySelect(0, TimeCurrent());
+    lastHistoryTotal = HistoryDealsTotal();
+    lastHistoryCheck = TimeCurrent();
+
+    activeRiskPercent     = RiskPercentPerTrade;
+    activeMaxTradesPerDay = MaxTradesPerDay;
+
+    originalRiskPercent = RiskPercentPerTrade;
+    originalMaxTrades   = MaxTradesPerDay;
+    originalDailyLoss   = MaxDailyLossPercent;
+    originalWeeklyLoss  = MaxWeeklyLossPercent;
+
+    if(EnableSmallAccountMode)
+        CheckAndApplySmallAccountMode();
+    else
+    { smallAccountModeActive = false; Print("Small Account Mode: DISABLED"); }
+
+    // PATCH 3: Init M1 microtrading layer (non-fatal if deferred)
+    if(!InitializeMicrotradingIndicators())
+        Print("NOTE: M1 indicator init deferred. Trend-regime M1 layer offline until data warms.");
+
+    Print("=== Guardian EURUSD v2 Initialised ===");
+    Print("Balance: $", DoubleToString(dailyStartBalance, 2));
+    Print("Risk: ", DoubleToString(RiskPercentPerTrade,2), "% | CMI regime: ACTIVE | M1 layer: ACTIVE");
+    return INIT_SUCCEEDED;
+}
+
+//=== ONDEINIT ======================================================
+
+void OnDeinit(const int reason)
+{
+    DeinitMicrotradingIndicators();
+    if(emaHandle != INVALID_HANDLE) IndicatorRelease(emaHandle);
+    if(rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
+    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+    Print("=== EA Deinitialized ===");
+}
+
+//=== ONTICK ========================================================
+
+void OnTick()
+{
+    CheckAccountFloor();
+    if(accountFloorHit) return;
+
+    PrintDailyDiagnostic();
+    CheckTimeResets();
+
+    if(EnableSmallAccountMode) CheckAndApplySmallAccountMode();
+    ManageConservativeMode();
+    CheckClosedPosition();
+    DetectSpreadSpike();
+
+    if(!ShouldTrade())          return;
+    if(!CheckSpreadConditions()) return;
+
+    if(PositionSelect(_Symbol))
     {
-        Print("❌ PATCH3-INIT: Failed to create RSI-14 M1 handle. Error: ", GetLastError());
-        IndicatorRelease(g_m1_ema18Handle);
-        IndicatorRelease(g_m1_ema3Handle);
-        IndicatorRelease(g_m1_macdHandle);
-        g_m1_ema18Handle = INVALID_HANDLE;
-        g_m1_ema3Handle  = INVALID_HANDLE;
-        g_m1_macdHandle  = INVALID_HANDLE;
-        return false;
+        ManagePosition();
+        ApplyTrailingStop();
+        return;
     }
 
-    Print("✅ PATCH3-INIT: All four M1 microtrading handles initialized successfully.");
-    Print("   EMA-18 M1 (EBB midline) : handle=", g_m1_ema18Handle);
-    Print("   EMA-3  M1 (fast signal) : handle=", g_m1_ema3Handle);
-    Print("   MACD(12,26,9) M1        : handle=", g_m1_macdHandle);
-    Print("   RSI(14) M1              : handle=", g_m1_rsi14Handle);
+    if(!CheckExecutionCooldown()) return;
+    CheckForEntry();
+}
+
+//=== ONTRADE_TRANSACTION ===========================================
+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                        const MqlTradeRequest& request,
+                        const MqlTradeResult& result)
+{
+    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+    ulong dealTicket = trans.deal;
+    if(dealTicket == 0 || !HistoryDealSelect(dealTicket)) return;
+
+    long   dealType   = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+    double dealProfit = HistoryDealGetDouble (dealTicket, DEAL_PROFIT);
+    double dealVolume = HistoryDealGetDouble (dealTicket, DEAL_VOLUME);
+    string dealSymbol = HistoryDealGetString (dealTicket, DEAL_SYMBOL);
+    long   dealMagic  = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+
+    if(dealType == DEAL_TYPE_BALANCE)
+    {
+        double curBal   = AccountInfoDouble(ACCOUNT_BALANCE);
+        double absAmt   = MathAbs(dealProfit);
+        double minThr   = GetEffectiveMinWithdrawal();
+
+        if(dealProfit < 0)
+        {
+            if(absAmt < minThr) { Print("Small withdrawal ignored ($", DoubleToString(absAmt,2), ")"); return; }
+            Print("WITHDRAWAL DETECTED: $", DoubleToString(absAmt,2));
+            RebalanceEAAfterBalanceChange("WITHDRAWAL", dealProfit, curBal);
+        }
+        else if(dealProfit > 0)
+        {
+            if(absAmt < minThr) { Print("Small deposit ignored ($", DoubleToString(absAmt,2), ")"); return; }
+            Print("DEPOSIT DETECTED: $", DoubleToString(absAmt,2));
+            RebalanceEAAfterBalanceChange("DEPOSIT", dealProfit, curBal);
+        }
+        return;
+    }
+
+    if(dealMagic != MagicNumber || dealSymbol != _Symbol) return;
+    long dealEntry = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+    if(dealEntry != DEAL_ENTRY_OUT) return;
+
+    if(dealProfit < 0) Print("TRADE LOSS:   $", DoubleToString(dealProfit,2));
+    else               Print("TRADE PROFIT: $", DoubleToString(dealProfit,2));
+}
+
+//=== REBALANCE =====================================================
+
+void RebalanceEAAfterBalanceChange(string opType, double amount, double newBal)
+{
+    Print("EA REBALANCE: ", opType, " $", DoubleToString(MathAbs(amount),2),
+          " -> new balance $", DoubleToString(newBal,2));
+    dailyStartBalance  = newBal; weeklyStartBalance = newBal; lastKnownBalance = newBal;
+    consecutiveLosses  = 0; tradesThisDay = 0;
+    dailyLossHit       = false; weeklyLossHit = false;
+    weeklyTargetReached = false; weeklyTargetReachedTime = 0;
+    pauseUntil         = 0;
+    if(conservativeMode && newBal < MaxEquityRange)
+    { conservativeMode = false; activeRiskPercent = RiskPercentPerTrade; activeMaxTradesPerDay = MaxTradesPerDay; }
+    NotifyUser(opType + " ($" + DoubleToString(MathAbs(amount),2) + "). Rebalanced to $" + DoubleToString(newBal,2));
+}
+
+//=== SHOULD TRADE ==================================================
+
+bool ShouldTrade()
+{
+    if(TimeCurrent() < pauseUntil)              return false;
+    if(emergencyStopActive)                     return false;
+    if(AccountInfoDouble(ACCOUNT_EQUITY) < MinEquityRange) return false;
+    if(dailyLossHit || weeklyLossHit || weeklyTargetReached) return false;
+    if(tradesThisDay >= activeMaxTradesPerDay)  return false;
+    if(!IsTradingTime())                        return false;
+    if(EnableNewsFilter && IsNewsEvent())       return false;
     return true;
 }
 
+//=== SAFETY CHECKS =================================================
 
-// =================================================================
-// PATCH 6 — DeinitMicrotradingIndicators()
-//            NEW FUNCTION — insert near OnDeinit()
-// =================================================================
-
-//+------------------------------------------------------------------+
-//| Release all M1 microtrading indicator handles gracefully         |
-//+------------------------------------------------------------------+
-void DeinitMicrotradingIndicators()
+bool CheckSlippage(ENUM_ORDER_TYPE orderType, double expectedPrice)
 {
-    if(g_m1_ema18Handle != INVALID_HANDLE)
-    {
-        IndicatorRelease(g_m1_ema18Handle);
-        g_m1_ema18Handle = INVALID_HANDLE;
-    }
-    if(g_m1_ema3Handle != INVALID_HANDLE)
-    {
-        IndicatorRelease(g_m1_ema3Handle);
-        g_m1_ema3Handle = INVALID_HANDLE;
-    }
-    if(g_m1_macdHandle != INVALID_HANDLE)
-    {
-        IndicatorRelease(g_m1_macdHandle);
-        g_m1_macdHandle = INVALID_HANDLE;
-    }
-    if(g_m1_rsi14Handle != INVALID_HANDLE)
-    {
-        IndicatorRelease(g_m1_rsi14Handle);
-        g_m1_rsi14Handle = INVALID_HANDLE;
-    }
-    Print("PATCH3-DEINIT: M1 indicator handles released.");
+    double cp = (orderType == ORDER_TYPE_BUY) ?
+                SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double slip = MathAbs(cp - expectedPrice) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(slip > MaxSlippagePoints) { Print("SAFETY: Slippage ", DoubleToString(slip,1), " pts > max ", MaxSlippagePoints); return false; }
+    return true;
 }
 
-
-// =================================================================
-// PATCH 1 — CalculateLotSize()
-//            FULL REPLACEMENT of the original function
-//
-// KEY CHANGES vs. original:
-//  1. 0.50% hard cap enforced unconditionally (Small Account Mode).
-//  2. Strict MathFloor() truncation — identical to original line 1737
-//     BUT the MathMax() fallback that followed it is GONE.
-//  3. If truncated lot < SYMBOL_VOLUME_MIN → CRITICAL error + return 0
-//     (The existing OpenTrade() guard will catch the 0 and abort.)
-//  4. All monetary math uses the raw ACCOUNT_EQUITY value which
-//     MetaTrader reports in account currency. On an Exness Standard
-//     Cent account that is USC (e.g. 5 000 USC for a $50 deposit).
-//     SYMBOL_TRADE_TICK_VALUE is also denominated in USC, so the
-//     formula is dimensionally consistent without any conversion.
-// =================================================================
-
-//+------------------------------------------------------------------+
-//| Calculate lot size — USC cent-account aware, strictly truncated   |
-//+------------------------------------------------------------------+
-double CalculateLotSize(double stopLossPips)
+bool CheckFreeMarginBuffer(double lotSize)
 {
-    // ------------------------------------------------------------------
-    // STEP 0: Hard-cap the active risk at 0.50% (Small Account Growth
-    //         Mode mandate).  We do this INSIDE the function so that
-    //         even if activeRiskPercent was raised elsewhere (e.g. by a
-    //         conservative-mode deactivation race), this function can
-    //         never over-leverage the account.
-    // ------------------------------------------------------------------
-    const double USC_HARD_CAP_RISK_PCT = 0.50; // ← never exceed on USC acct
-    double effectiveRisk = MathMin(activeRiskPercent, USC_HARD_CAP_RISK_PCT);
-
-    if(activeRiskPercent > USC_HARD_CAP_RISK_PCT)
-    {
-        Print("⚠️ PATCH1-RISK: activeRiskPercent (", DoubleToString(activeRiskPercent, 3),
-              "%) capped to ", USC_HARD_CAP_RISK_PCT, "% (USC cent-account safety)");
-    }
-
-    // ------------------------------------------------------------------
-    // STEP 1: Determine the effective stop-loss (pips).
-    //         Use broker-adapted value when available (set in OnInit).
-    // ------------------------------------------------------------------
-    double effectiveStopLoss = (adaptedStopLoss > 0.0) ? adaptedStopLoss : stopLossPips;
-
-    // ------------------------------------------------------------------
-    // STEP 2: Calculate the monetary risk amount in account currency.
-    //         On Exness Standard Cent, ACCOUNT_EQUITY is in USC.
-    //         Example: equity = 5 000 USC, risk 0.50% → riskAmount = 25 USC
-    // ------------------------------------------------------------------
-    double equity      = AccountInfoDouble(ACCOUNT_EQUITY);
-    double riskAmount  = equity * (effectiveRisk / 100.0);
-
-    if(equity <= 0.0)
-    {
-        Print("❌ PATCH1-CRITICAL: ACCOUNT_EQUITY returned ", equity,
-              " — Cannot calculate lot size. Trade ABORTED.");
-        return 0.0;
-    }
-
-    // ------------------------------------------------------------------
-    // STEP 3: Convert the stop-loss from pips to a price distance.
-    //         Handles both 3/5-digit (ECN) and 2/4-digit brokers.
-    // ------------------------------------------------------------------
-    int    digits      = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    double point       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double pipSize     = (digits == 3 || digits == 5) ? point * 10.0 : point;
-    double slPrice     = effectiveStopLoss * pipSize; // price distance for the SL
-
-    // ------------------------------------------------------------------
-    // STEP 4: Fetch tick parameters.
-    //         tickValue = monetary value of one tick per 1 full lot, in USC.
-    //         tickSize  = price distance of one tick.
-    //         pipValuePerLot = USC value of a 1-pip move per 1 lot.
-    // ------------------------------------------------------------------
-    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-
-    if(tickValue <= 0.0 || tickSize <= 0.0)
-    {
-        Print("❌ PATCH1-CRITICAL: Invalid tick params — tickValue=", tickValue,
-              " tickSize=", tickSize, ". Trade ABORTED.");
-        return 0.0;
-    }
-
-    // Monetary value of moving 1 pip with a 1-lot position (in USC)
-    double pipValuePerLot = (tickValue / tickSize) * pipSize;
-
-    if(pipValuePerLot <= 0.0)
-    {
-        Print("❌ PATCH1-CRITICAL: pipValuePerLot computed as ", pipValuePerLot,
-              " — likely bad tick data. Trade ABORTED.");
-        return 0.0;
-    }
-
-    // ------------------------------------------------------------------
-    // STEP 5: Raw (unrounded) lot size.
-    //         Formula: lots = riskAmount / (stopLoss_pips × pipValuePerLot)
-    // ------------------------------------------------------------------
-    double rawLotSize = riskAmount / (effectiveStopLoss * pipValuePerLot);
-
-    // ------------------------------------------------------------------
-    // STEP 6: STRICT DOWNWARD TRUNCATION.
-    //         We floor to the nearest broker lot step.
-    //         This is intentionally conservative: we NEVER round up
-    //         because even a partial step up can materially over-leverage
-    //         a micro-sized USC account.
-    //
-    //         Example on Exness Cent:
-    //           brokerLotStep = 0.01
-    //           rawLotSize    = 0.0137
-    //           truncated     = floor(0.0137 / 0.01) * 0.01 = 0.01  ✓
-    //           (standard round would give 0.01, same result here, but
-    //            for rawLotSize = 0.0187 round gives 0.02, floor gives 0.01)
-    // ------------------------------------------------------------------
-    double truncatedLot = MathFloor(rawLotSize / brokerLotStep) * brokerLotStep;
-
-    // Diagnostic: show the truncation delta
-    if(EnableTestMode)
-    {
-        Print("PATCH1-LOTCALC: equity=", DoubleToString(equity, 2),
-              " USC | risk=", DoubleToString(effectiveRisk, 3), "%",
-              " | riskAmt=", DoubleToString(riskAmount, 4), " USC");
-        Print("PATCH1-LOTCALC: SL=", effectiveStopLoss, " pips",
-              " | pipVal/lot=", DoubleToString(pipValuePerLot, 6), " USC",
-              " | rawLot=", DoubleToString(rawLotSize, 6),
-              " | truncated=", DoubleToString(truncatedLot, 4));
-    }
-
-    // ------------------------------------------------------------------
-    // STEP 7: HARD BLOCK — if truncated lot < SYMBOL_VOLUME_MIN,
-    //         the account balance is simply too small to support even
-    //         the minimum broker position at the requested risk level.
-    //         ABORT with a critical log.  OpenTrade() will catch the
-    //         0.0 return and block execution.
-    //
-    //         DO NOT silently fall back to brokerMinLot here — doing so
-    //         would open a trade with ACTUAL risk >> intended risk, which
-    //         is the exact lot-sizing paradox we are eliminating.
-    // ------------------------------------------------------------------
-    double volMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-
-    if(truncatedLot < volMin)
-    {
-        double actualRiskIfMin = (volMin * effectiveStopLoss * pipValuePerLot / equity) * 100.0;
-
-        Print("╔══════════════════════════════════════════════════════════════╗");
-        Print("║  PATCH1-CRITICAL: LOT SIZE BELOW BROKER MINIMUM — ABORTED  ║");
-        Print("╠══════════════════════════════════════════════════════════════╣");
-        Print("║  Calculated lot (truncated) : ", DoubleToString(truncatedLot, 4));
-        Print("║  Broker SYMBOL_VOLUME_MIN   : ", DoubleToString(volMin, 4));
-        Print("║  Intended risk              : ", DoubleToString(effectiveRisk, 3), "%");
-        Print("║  Risk if min lot forced     : ", DoubleToString(actualRiskIfMin, 2),
-              "% (EXCEEDS CAP — silent fallback refused)");
-        Print("║  Account equity             : ", DoubleToString(equity, 2), " USC");
-        Print("║  Action: Trade ABORTED. Grow account before next attempt.  ║");
-        Print("╚══════════════════════════════════════════════════════════════╝");
-
-        NotifyUser("CRITICAL: Lot size below broker minimum. Trade blocked. "
-                   "Equity: " + DoubleToString(equity, 2) + " USC. "
-                   "Min lot: " + DoubleToString(volMin, 4) + ".");
-        return 0.0; // ← OpenTrade() catches this and hard-aborts
-    }
-
-    // ------------------------------------------------------------------
-    // STEP 8: Apply broker MAXIMUM lot cap.
-    //         This is the only MathMin() / MathMax() allowed — capping
-    //         above the broker maximum is a hard broker-API requirement,
-    //         not a risk escalation.
-    // ------------------------------------------------------------------
-    double volMax    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-    double finalLot  = MathMin(truncatedLot, volMax);
-
-    if(finalLot < truncatedLot)
-    {
-        Print("⚠️ PATCH1: truncatedLot (", DoubleToString(truncatedLot, 4),
-              ") clipped to SYMBOL_VOLUME_MAX (", DoubleToString(volMax, 4), ")");
-    }
-
-    // ------------------------------------------------------------------
-    // STEP 9: Final normalisation (MQL5 requirement: 2 decimal places
-    //         is standard for most brokers).
-    // ------------------------------------------------------------------
-    finalLot = NormalizeDouble(finalLot, 2);
-
-    // Actual risk verification log (always shown, not just in test mode)
-    double actualRiskAmt  = finalLot * effectiveStopLoss * pipValuePerLot;
-    double actualRiskPct  = (actualRiskAmt / equity) * 100.0;
-    Print("✅ PATCH1-LOT: ", DoubleToString(finalLot, 2), " lots",
-          " | Actual risk: ", DoubleToString(actualRiskPct, 3),
-          "% (", DoubleToString(actualRiskAmt, 4), " USC)");
-
-    return finalLot;
+    double freeMgn = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+    double req = 0;
+    if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lotSize, SymbolInfoDouble(_Symbol, SYMBOL_ASK), req))
+    { Print("SAFETY: Margin calc failed."); return false; }
+    if((freeMgn - req) < req * (MarginBufferPercent / 100.0))
+    { Print("SAFETY: Margin buffer insufficient."); return false; }
+    return true;
 }
 
+bool IsTradingTime()
+{
+    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+    if(dt.day_of_week == 0 || dt.day_of_week == 6) return false;
+    if(dt.day_of_week == 1 && dt.hour < 2)          return false;
+    if(dt.day_of_week == 5 && dt.hour >= 20)         return false;
+    return (dt.hour >= 7 && dt.hour < 21);
+}
 
-// =================================================================
-// PATCH 2 — CalculateCMI()
-//            NEW FUNCTION — insert before CheckForEntry()
-//
-// The Choppy Market Index measures how directionally the market
-// moved over the look-back period relative to its total range.
-//
-//   CMI = |Close[0] - Close[n-1]| / (HighestHigh[n] - LowestLow[n]) × 100
-//
-// Interpretation used here (per spec):
-//   CMI < 20  → choppy / sideways → SWING regime (Mean Reversion)
-//   CMI ≥ 20  → directional      → TREND regime (Trend Following + M1 layer)
-//
-// Note: The CMI is calculated on the CURRENT chart timeframe (M5 or
-//       higher, enforced by OnInit). Using the execution chart TF
-//       gives the regime relevant to the position-entry decision.
-// =================================================================
+bool CheckSpreadConditions()
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK), bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double pt  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double pv  = (dg == 3 || dg == 5) ? pt * 10.0 : pt;
+    int    sp  = (int)((ask - bid) / pv);
+    if(sp > MaxAllowedSpreadPoints) return false;
+    if(sp <= MaxSpreadPoints) { highSpreadCounter = 0; return true; }
+    datetime cm = GetCurrentMinute();
+    if(cm != lastSpreadCheck)
+    {
+        highSpreadCounter++; lastSpreadCheck = cm;
+        if(highSpreadCounter >= HighSpreadMinutes)
+        {
+            pauseUntil = MathMax(pauseUntil, TimeCurrent() + (SpreadPauseMinutes * 60));
+            NotifyUser("High spread pause " + IntegerToString(SpreadPauseMinutes) + " min.");
+            highSpreadCounter = 0;
+        }
+    }
+    return false;
+}
 
-//+------------------------------------------------------------------+
-//| Calculate 30-period Choppy Market Index on the current timeframe |
-//| Returns value in [0, 100].  Returns -1.0 on data error.         |
-//+------------------------------------------------------------------+
+bool CheckMarginSufficiency(ENUM_ORDER_TYPE ot, double lots)
+{
+    double fm = AccountInfoDouble(ACCOUNT_MARGIN_FREE), req = 0;
+    double pr = (ot == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    if(!OrderCalcMargin(ot, _Symbol, lots, pr, req)) { Print("SAFETY: Margin calc failed."); return false; }
+    if(fm < req * (MinFreeMarginPercent / 100.0)) { Print("SAFETY: Insufficient margin. Free:$", DoubleToString(fm,2)); return false; }
+    return true;
+}
+
+bool ValidateStopLevels(ENUM_ORDER_TYPE ot, double price, double sl, double tp)
+{
+    int lvl = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    if(lvl == 0) return true;
+    double minD = lvl * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(MathAbs(price - sl) < minD) { Print("SAFETY: SL too close."); return false; }
+    if(MathAbs(price - tp) < minD) { Print("SAFETY: TP too close."); return false; }
+    return true;
+}
+
+//=== LEGACY TREND FILTER (kept for reference, no longer called by CheckForEntry) ===
+
+bool IsMarketTrending()
+{
+    if(DisableTrendFilter) return true;
+    int h50 = iMA(_Symbol, PERIOD_H1, 50,  0, MODE_EMA, PRICE_CLOSE);
+    int h100= iMA(_Symbol, PERIOD_H1, 100, 0, MODE_EMA, PRICE_CLOSE);
+    if(h50 == INVALID_HANDLE || h100 == INVALID_HANDLE) return true;
+    double a[], b[]; ArraySetAsSeries(a, true); ArraySetAsSeries(b, true);
+    if(CopyBuffer(h50,0,0,1,a)<1 || CopyBuffer(h100,0,0,1,b)<1) { IndicatorRelease(h50); IndicatorRelease(h100); return true; }
+    IndicatorRelease(h50); IndicatorRelease(h100);
+    double sep = MathAbs(a[0]-b[0]), avg = (a[0]+b[0])/2.0;
+    return ((sep/avg)*100.0 >= 0.004);
+}
+
+//===================================================================
+// PATCH 2 - CalculateCMI()
+// 30-period Choppy Market Index on the current chart timeframe.
+// Formula: CMI = |Close[0]-Close[29]| / (HighestHigh[30]-LowestLow[30]) * 100
+// Returns [0,100]. Returns -1.0 on data error.
+// CMI < 20  -> SWING (Mean Reversion)
+// CMI >= 20 -> TREND (Trend Following + M1 layer)
+//===================================================================
+
 double CalculateCMI()
 {
-    const int CMI_PERIOD = 30; // canonical look-back window
+    const int P = 30;
+    double cl[], hi[], lo[];
+    ArraySetAsSeries(cl, true); ArraySetAsSeries(hi, true); ArraySetAsSeries(lo, true);
 
-    // ------------------------------------------------------------------
-    // Fetch the last CMI_PERIOD closes, highs, and lows.
-    // ArraySetAsSeries(true) means index 0 = most recent bar.
-    // ------------------------------------------------------------------
-    double closeArr[], highArr[], lowArr[];
-    ArraySetAsSeries(closeArr, true);
-    ArraySetAsSeries(highArr,  true);
-    ArraySetAsSeries(lowArr,   true);
-
-    //--- We need CMI_PERIOD bars so the oldest close is at index CMI_PERIOD-1
-    if(CopyClose(_Symbol, PERIOD_CURRENT, 0, CMI_PERIOD, closeArr) < CMI_PERIOD)
+    if(CopyClose(_Symbol, PERIOD_CURRENT, 0, P, cl) < P)
     {
-        static datetime lastCMIErr = 0;
-        if(TimeCurrent() - lastCMIErr > 60)
-        {
-            Print("⚠️ PATCH2-CMI: CopyClose failed (", CMI_PERIOD, " bars). Error: ", GetLastError());
-            lastCMIErr = TimeCurrent();
-        }
-        return -1.0; // caller must treat as invalid
-    }
-
-    if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, CMI_PERIOD, highArr) < CMI_PERIOD ||
-       CopyLow (_Symbol, PERIOD_CURRENT, 0, CMI_PERIOD, lowArr)  < CMI_PERIOD)
-    {
-        Print("⚠️ PATCH2-CMI: CopyHigh/CopyLow failed. Error: ", GetLastError());
+        static datetime errLog = 0;
+        if(TimeCurrent()-errLog > 60) { Print("CMI WARN: CopyClose failed. Err:", GetLastError()); errLog = TimeCurrent(); }
         return -1.0;
     }
+    if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, P, hi) < P || CopyLow(_Symbol, PERIOD_CURRENT, 0, P, lo) < P)
+    { Print("CMI WARN: CopyHigh/CopyLow failed. Err:", GetLastError()); return -1.0; }
 
-    // ------------------------------------------------------------------
-    // Numerator: absolute net price displacement over the window.
-    //   closeArr[0]           = Close of the current (most recent) bar
-    //   closeArr[CMI_PERIOD-1] = Close of the bar 29 periods ago
-    // ------------------------------------------------------------------
-    double netDisplacement = MathAbs(closeArr[0] - closeArr[CMI_PERIOD - 1]);
+    double disp  = MathAbs(cl[0] - cl[P-1]);
+    double range = hi[ArrayMaximum(hi,0,P)] - lo[ArrayMinimum(lo,0,P)];
+    if(range <= 0.0) { Print("CMI WARN: range=0. Returning 0."); return 0.0; }
 
-    // ------------------------------------------------------------------
-    // Denominator: total high-low range over the same window.
-    //   ArrayMaximum / ArrayMinimum search the FULL array.
-    // ------------------------------------------------------------------
-    int    maxIdx  = ArrayMaximum(highArr, 0, CMI_PERIOD);
-    int    minIdx  = ArrayMinimum(lowArr,  0, CMI_PERIOD);
-    double highest = highArr[maxIdx];
-    double lowest  = lowArr [minIdx];
-    double totalRange = highest - lowest;
+    double cmi = MathMax(0.0, MathMin(100.0, (disp/range)*100.0));
 
-    // Guard against a zero-range condition (e.g. on a newly created symbol
-    // or during a pre-market freeze).
-    if(totalRange <= 0.0)
+    if(TimeCurrent() - g_lastCMILog >= 60)
     {
-        Print("⚠️ PATCH2-CMI: totalRange is zero — market data anomaly. Returning 0.");
-        return 0.0;
-    }
-
-    // ------------------------------------------------------------------
-    // CMI formula (as specified)
-    // ------------------------------------------------------------------
-    double cmi = (netDisplacement / totalRange) * 100.0;
-
-    // Clamp to [0, 100] to protect against floating-point edge cases
-    cmi = MathMax(0.0, MathMin(100.0, cmi));
-
-    // Rate-limited diagnostic log (once per minute unless test mode)
-    if(TimeCurrent() - g_lastCMILog >= 60 || EnableTestMode)
-    {
-        string regimeStr = (cmi < 20.0) ? "SWING (Mean Reversion)" : "TREND (Trend-Following)";
-        Print("PATCH2-CMI: CMI=", DoubleToString(cmi, 2),
-              " | Regime: ", regimeStr,
-              " | NetDisp=", DoubleToString(netDisplacement, 5),
-              " | Range=", DoubleToString(totalRange, 5));
+        Print("CMI:", DoubleToString(cmi,2), " Regime:", (cmi < 20.0 ? "SWING" : "TREND"),
+              " Range:", DoubleToString(range,5), " Disp:", DoubleToString(disp,5));
         g_lastCMILog = TimeCurrent();
     }
-
     return cmi;
 }
 
+//===================================================================
+// PATCH 3a - InitializeMicrotradingIndicators()
+//===================================================================
 
-// =================================================================
-// PATCH 4 — GetM1MicrotradingSignal()
-//            NEW FUNCTION — insert before CheckForEntry()
-//
-// Evaluates four-indicator confluence on the M1 chart.
-// Only called when CMI ≥ 20 (TREND regime).
-//
-// INDICATORS
-//   1. EBB midline  = EMA(18) on M1  [g_m1_ema18Handle]
-//   2. Fast EMA     = EMA(3)  on M1  [g_m1_ema3Handle ]
-//   3. MACD hist    = MACD(12,26,9) M1 main - signal [g_m1_macdHandle]
-//   4. RSI(14)      on M1            [g_m1_rsi14Handle]
-//
-// SIGNAL RULES
-//   BUY  : EMA-3 crosses UP through EBB midline (EMA-18)
-//          AND MACD histogram > 0
-//          AND RSI > 50
-//
-//   SELL : EMA-3 crosses DOWN through EBB midline (EMA-18)
-//          AND MACD histogram < 0
-//          AND RSI < 50
-//
-//   NOTE: "Crosses" is defined as:
-//         Bar[1] (previous M1 close): EMA-3 was on one side
-//         Bar[0] (current  M1 close): EMA-3 is on the other side
-//
-// RETURNS
-//   +1 = BUY signal
-//   -1 = SELL signal
-//    0 = No signal / error
-// =================================================================
+bool InitializeMicrotradingIndicators()
+{
+    if(Bars(_Symbol, PERIOD_M1) < 50) { Print("M1-INIT: Insufficient M1 bars. Deferring."); return false; }
 
-//+------------------------------------------------------------------+
-//| Evaluate M1 microtrading signal (Trend regime only)             |
-//| Returns: +1 = BUY | -1 = SELL | 0 = NO SIGNAL                  |
-//+------------------------------------------------------------------+
+    g_m1_ema18Handle = iMA(_Symbol, PERIOD_M1, 18, 0, MODE_EMA, PRICE_CLOSE);
+    if(g_m1_ema18Handle == INVALID_HANDLE) { Print("M1-INIT ERROR: EMA18 failed. Err:", GetLastError()); return false; }
+
+    g_m1_ema3Handle = iMA(_Symbol, PERIOD_M1, 3, 0, MODE_EMA, PRICE_CLOSE);
+    if(g_m1_ema3Handle == INVALID_HANDLE)
+    { Print("M1-INIT ERROR: EMA3 failed."); IndicatorRelease(g_m1_ema18Handle); g_m1_ema18Handle=INVALID_HANDLE; return false; }
+
+    g_m1_macdHandle = iMACD(_Symbol, PERIOD_M1, 12, 26, 9, PRICE_CLOSE);
+    if(g_m1_macdHandle == INVALID_HANDLE)
+    { Print("M1-INIT ERROR: MACD failed."); IndicatorRelease(g_m1_ema18Handle); IndicatorRelease(g_m1_ema3Handle); g_m1_ema18Handle=INVALID_HANDLE; g_m1_ema3Handle=INVALID_HANDLE; return false; }
+
+    g_m1_rsi14Handle = iRSI(_Symbol, PERIOD_M1, 14, PRICE_CLOSE);
+    if(g_m1_rsi14Handle == INVALID_HANDLE)
+    { Print("M1-INIT ERROR: RSI14 failed."); IndicatorRelease(g_m1_ema18Handle); IndicatorRelease(g_m1_ema3Handle); IndicatorRelease(g_m1_macdHandle); g_m1_ema18Handle=INVALID_HANDLE; g_m1_ema3Handle=INVALID_HANDLE; g_m1_macdHandle=INVALID_HANDLE; return false; }
+
+    Print("M1-INIT OK: All 4 handles ready. EMA18=", g_m1_ema18Handle, " EMA3=", g_m1_ema3Handle, " MACD=", g_m1_macdHandle, " RSI14=", g_m1_rsi14Handle);
+    return true;
+}
+
+//===================================================================
+// PATCH 3b - DeinitMicrotradingIndicators()
+//===================================================================
+
+void DeinitMicrotradingIndicators()
+{
+    if(g_m1_ema18Handle != INVALID_HANDLE) { IndicatorRelease(g_m1_ema18Handle); g_m1_ema18Handle = INVALID_HANDLE; }
+    if(g_m1_ema3Handle  != INVALID_HANDLE) { IndicatorRelease(g_m1_ema3Handle);  g_m1_ema3Handle  = INVALID_HANDLE; }
+    if(g_m1_macdHandle  != INVALID_HANDLE) { IndicatorRelease(g_m1_macdHandle);  g_m1_macdHandle  = INVALID_HANDLE; }
+    if(g_m1_rsi14Handle != INVALID_HANDLE) { IndicatorRelease(g_m1_rsi14Handle); g_m1_rsi14Handle = INVALID_HANDLE; }
+    Print("M1-DEINIT: All M1 handles released.");
+}
+
+//===================================================================
+// PATCH 3c - GetM1MicrotradingSignal()
+// Four-indicator confluence on M1 timeframe.
+//
+// EBB midline = EMA(18) on M1  (exponential BB midline IS the EMA)
+// Fast EMA    = EMA(3)  on M1
+// MACD hist   = MACD(12,26,9) main-signal on M1
+// RSI(14)     on M1
+//
+// BUY  signal: EMA3 crosses UP   through EBB18, MACD hist > 0, RSI > 50
+// SELL signal: EMA3 crosses DOWN through EBB18, MACD hist < 0, RSI < 50
+//
+// Returns: +1=BUY  -1=SELL  0=NO SIGNAL
+//===================================================================
+
 int GetM1MicrotradingSignal()
 {
-    // ------------------------------------------------------------------
-    // Guard: handles must be valid.  If init was deferred, attempt lazy
-    // re-initialisation so the system is self-healing.
-    // ------------------------------------------------------------------
-    if(g_m1_ema18Handle == INVALID_HANDLE ||
-       g_m1_ema3Handle  == INVALID_HANDLE ||
-       g_m1_macdHandle  == INVALID_HANDLE ||
-       g_m1_rsi14Handle == INVALID_HANDLE)
+    if(g_m1_ema18Handle==INVALID_HANDLE || g_m1_ema3Handle==INVALID_HANDLE ||
+       g_m1_macdHandle==INVALID_HANDLE  || g_m1_rsi14Handle==INVALID_HANDLE)
     {
-        Print("⚠️ PATCH4-M1: One or more M1 handles invalid. Attempting lazy re-init...");
-        if(!InitializeMicrotradingIndicators())
-        {
-            Print("⚠️ PATCH4-M1: Re-init failed. Returning NO SIGNAL.");
-            return 0;
-        }
+        Print("M1-SIG: Handles invalid — lazy re-init...");
+        if(!InitializeMicrotradingIndicators()) { Print("M1-SIG: Re-init failed. NO SIGNAL."); return 0; }
     }
 
-    // ------------------------------------------------------------------
-    // Read indicator buffers — we need 2 bars (current + previous) for
-    // the crossover detection, 1 bar for MACD and RSI confirmations.
-    //
-    // Buffer layout for iMACD:
-    //   Buffer 0 = MACD main line  (fast EMA - slow EMA)
-    //   Buffer 1 = MACD signal line
-    //   Histogram = Buffer0 - Buffer1  (computed manually)
-    // ------------------------------------------------------------------
-    double ema18[2], ema3[2], macdMain[1], macdSignal[1], rsi[1];
+    double ema18[], ema3[], mMain[], mSig[], rsi[];
+    ArrayResize(ema18, 2); ArrayResize(ema3, 2);
+    ArrayResize(mMain, 1); ArrayResize(mSig, 1); ArrayResize(rsi, 1);
+    ArraySetAsSeries(ema18, true); ArraySetAsSeries(ema3, true);
+    ArraySetAsSeries(mMain, true); ArraySetAsSeries(mSig, true); ArraySetAsSeries(rsi, true);
 
-    ArraySetAsSeries(ema18,      true);
-    ArraySetAsSeries(ema3,       true);
-    ArraySetAsSeries(macdMain,   true);
-    ArraySetAsSeries(macdSignal, true);
-    ArraySetAsSeries(rsi,        true);
+    if(CopyBuffer(g_m1_ema18Handle, 0, 0, 2, ema18) < 2) { Print("M1-SIG WARN: EMA18 buf fail."); return 0; }
+    if(CopyBuffer(g_m1_ema3Handle,  0, 0, 2, ema3)  < 2) { Print("M1-SIG WARN: EMA3  buf fail."); return 0; }
+    if(CopyBuffer(g_m1_macdHandle,  0, 0, 1, mMain) < 1) { Print("M1-SIG WARN: MACD main fail."); return 0; }
+    if(CopyBuffer(g_m1_macdHandle,  1, 0, 1, mSig)  < 1) { Print("M1-SIG WARN: MACD sig  fail."); return 0; }
+    if(CopyBuffer(g_m1_rsi14Handle, 0, 0, 1, rsi)   < 1) { Print("M1-SIG WARN: RSI14 buf fail."); return 0; }
 
-    //--- EBB midline EMA-18 (2 bars for crossover)
-    if(CopyBuffer(g_m1_ema18Handle, 0, 0, 2, ema18) < 2)
-    {
-        Print("⚠️ PATCH4-M1: Failed to copy EMA-18 buffer. Error: ", GetLastError());
-        return 0;
-    }
+    // Crossover detection: [0]=current bar, [1]=previous bar
+    bool aboveNow  = (ema3[0] > ema18[0]);
+    bool abovePrev = (ema3[1] > ema18[1]);
+    bool crossUp   = (!abovePrev &&  aboveNow);
+    bool crossDown = ( abovePrev && !aboveNow);
 
-    //--- Fast EMA-3 (2 bars for crossover)
-    if(CopyBuffer(g_m1_ema3Handle, 0, 0, 2, ema3) < 2)
-    {
-        Print("⚠️ PATCH4-M1: Failed to copy EMA-3 buffer. Error: ", GetLastError());
-        return 0;
-    }
+    double hist = mMain[0] - mSig[0];
+    double rsiV = rsi[0];
 
-    //--- MACD main line and signal line (1 bar each)
-    if(CopyBuffer(g_m1_macdHandle, 0, 0, 1, macdMain)   < 1 ||
-       CopyBuffer(g_m1_macdHandle, 1, 0, 1, macdSignal) < 1)
-    {
-        Print("⚠️ PATCH4-M1: Failed to copy MACD buffer. Error: ", GetLastError());
-        return 0;
-    }
+    bool buyS  = (crossUp   && hist > 0.0 && rsiV > 50.0);
+    bool sellS = (crossDown && hist < 0.0 && rsiV < 50.0);
 
-    //--- RSI (1 bar)
-    if(CopyBuffer(g_m1_rsi14Handle, 0, 0, 1, rsi) < 1)
-    {
-        Print("⚠️ PATCH4-M1: Failed to copy RSI buffer. Error: ", GetLastError());
-        return 0;
-    }
-
-    // ------------------------------------------------------------------
-    // Derived values
-    // ------------------------------------------------------------------
-    // Crossover states — index[0] = current bar, index[1] = previous bar
-    bool ema3AboveEBBNow  = (ema3[0] > ema18[0]); // current bar
-    bool ema3AboveEBBPrev = (ema3[1] > ema18[1]); // previous bar
-
-    bool crossedUp   = (!ema3AboveEBBPrev && ema3AboveEBBNow);   // was below, now above
-    bool crossedDown = ( ema3AboveEBBPrev && !ema3AboveEBBNow);  // was above, now below
-
-    // MACD histogram
-    double macdHistogram = macdMain[0] - macdSignal[0];
-
-    // RSI value
-    double rsiValue = rsi[0];
-
-    // ------------------------------------------------------------------
-    // Confluence evaluation
-    // ------------------------------------------------------------------
-    bool buySignal  = (crossedUp   && macdHistogram > 0.0 && rsiValue > 50.0);
-    bool sellSignal = (crossedDown && macdHistogram < 0.0 && rsiValue < 50.0);
-
-    // ------------------------------------------------------------------
-    // Verbose diagnostic (test mode or once-per-minute)
-    // ------------------------------------------------------------------
     if(EnableTestMode)
     {
-        Print("═══════════ M1 MICROTRADING SIGNAL CHECK ═══════════");
-        Print("EMA-3[0]=",  DoubleToString(ema3[0],  5),
-              " vs EBB18[0]=", DoubleToString(ema18[0], 5));
-        Print("EMA-3[1]=",  DoubleToString(ema3[1],  5),
-              " vs EBB18[1]=", DoubleToString(ema18[1], 5));
-        Print("CrossedUP: ",   crossedUp   ? "YES" : "NO",
-              " | CrossedDOWN: ", crossedDown ? "YES" : "NO");
-        Print("MACD Hist: ", DoubleToString(macdHistogram, 6),
-              " (main=", DoubleToString(macdMain[0], 6),
-              " sig=",   DoubleToString(macdSignal[0], 6), ")");
-        Print("RSI(14) M1: ", DoubleToString(rsiValue, 2));
-        Print("BUY signal:  ", buySignal  ? "✅ YES" : "✗ NO");
-        Print("SELL signal: ", sellSignal ? "✅ YES" : "✗ NO");
-        Print("════════════════════════════════════════════════════");
+        Print("M1-SIG: EMA3[0]=", DoubleToString(ema3[0],5), " EBB18[0]=", DoubleToString(ema18[0],5),
+              " EMA3[1]=", DoubleToString(ema3[1],5), " EBB18[1]=", DoubleToString(ema18[1],5));
+        Print("M1-SIG: CrossUp=", crossUp, " CrossDn=", crossDown,
+              " Hist=", DoubleToString(hist,6), " RSI=", DoubleToString(rsiV,2),
+              " BUY=", buyS, " SELL=", sellS);
     }
 
-    // Conflict guard — both signals simultaneously should not happen,
-    // but if the data is ambiguous, stand down.
-    if(buySignal && sellSignal)
-    {
-        Print("⚠️ PATCH4-M1: BUY and SELL both true — conflict, returning NO SIGNAL.");
-        return 0;
-    }
-
-    if(buySignal)  return  1;
-    if(sellSignal) return -1;
+    if(buyS && sellS) { Print("M1-SIG: Conflict. NO SIGNAL."); return 0; }
+    if(buyS)  return  1;
+    if(sellS) return -1;
     return 0;
 }
 
+//===================================================================
+// PATCH 2+3 - CheckForEntry()  [FULL REPLACEMENT]
+//
+// REMOVED: IsMarketTrending() static 0.03% EMA separation filter
+// REMOVED: hardcoded 0.00015 EMA slope threshold (ATR-dynamic retained)
+//
+// ADDED:
+//   CalculateCMI() for regime detection each bar
+//   TREND regime (CMI>=20): H1 context + M1 four-indicator confluence
+//   SWING regime (CMI<20):  Mean-reversion oversold/overbought entries
+//
+// COMPILE FIX: "ENUM_ORDER_TYPE = -1" was illegal MQL5 syntax.
+//   Solution: use plain int sentinel (-1=none, 0=BUY, 1=SELL),
+//   cast to ENUM_ORDER_TYPE ONLY at the single OpenTrade() call site.
+//===================================================================
 
-// =================================================================
-// PATCH 3 — CheckForEntry()
-//            FULL REPLACEMENT of the original function
-//
-// ARCHITECTURE CHANGES
-//  ┌──────────────────────────────────────────────────────────────┐
-//  │  DEPRECATED (removed)                                        │
-//  │  ─ IsMarketTrending() call (static 0.03% EMA separation)   │
-//  │  ─ hardcoded 0.00015 EMA slope threshold                    │
-//  │    (ATR-based dynamic slope is retained for SWING regime)   │
-//  │                                                              │
-//  │  ADDED                                                       │
-//  │  ─ CalculateCMI()  determines current market regime         │
-//  │  ─ SWING (CMI < 20):  Mean-Reversion branch                │
-//  │  ─ TREND (CMI ≥ 20):  Trend-Following branch               │
-//  │       ↳ GetM1MicrotradingSignal() for precise M1 entry      │
-//  └──────────────────────────────────────────────────────────────┘
-//
-// REGIME LOGIC SUMMARY
-//
-//  TREND REGIME (CMI ≥ 20)
-//    H1 context : EMA direction + price side + ATR slope (unchanged)
-//    M1 trigger : EMA-3 × EBB18 crossover + MACD hist sign + RSI side
-//    Both layers MUST agree for a trade to be opened.
-//
-//  SWING REGIME (CMI < 20)
-//    Mean-reversion entries: price overextended FROM EMA,
-//    RSI in extreme zone, and EMA slope is FLAT (weak momentum)
-//    — anticipating a snap-back.
-//    Uses ATR to define "overextended" (price > 2×ATR from EMA).
-// =================================================================
-
-//+------------------------------------------------------------------+
-//| Check for entry signals — CMI-gated dual-regime execution         |
-//+------------------------------------------------------------------+
 void CheckForEntry()
 {
-    // ------------------------------------------------------------------
-    // One-trade-per-bar guard (unchanged from original)
-    // ------------------------------------------------------------------
-    static datetime lastSignalBarTime = 0;
-    static ENUM_ORDER_TYPE committedDirection = (ENUM_ORDER_TYPE)-1;
+    // One-trade-per-bar guard
+    static datetime lastBarTime = 0;
+    datetime curBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+    if(curBarTime != lastBarTime) lastBarTime = 0;
+    if(curBarTime == lastBarTime) return;
 
-    datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
-
-    if(currentBarTime != lastSignalBarTime)
-    {
-        committedDirection = (ENUM_ORDER_TYPE)-1; // reset on new bar
-        lastSignalBarTime  = 0;
-    }
-    if(currentBarTime == lastSignalBarTime) return; // already traded this bar
-
-    // One position at a time
     if(PositionSelect(_Symbol)) return;
 
-    // ------------------------------------------------------------------
-    // STEP 1 — CMI REGIME DETECTION (Patch 2)
-    //          Replaces the deprecated IsMarketTrending() call.
-    // ------------------------------------------------------------------
+    // STEP 1: CMI regime detection (replaces IsMarketTrending)
     double cmi = CalculateCMI();
+    if(cmi < 0.0) return;
+    g_lastCMI      = cmi;
+    g_marketRegime = (cmi >= 20.0) ? "TREND" : "SWING";
+    bool isTrend   = (cmi >= 20.0);
+    bool isSwing   = !isTrend;
 
-    if(cmi < 0.0)
+    // STEP 2: Gather H1 context indicators
+    int hEMA = iMA(_Symbol, EMAPeriodTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    if(hEMA == INVALID_HANDLE) { Print("ENTRY WARN: H1 EMA handle failed."); return; }
+
+    double emaV[], rsiV[], atrV[];
+    ArrayResize(emaV, 2); ArrayResize(rsiV, 1); ArrayResize(atrV, 1);
+    ArraySetAsSeries(emaV, true); ArraySetAsSeries(rsiV, true); ArraySetAsSeries(atrV, true);
+
+    if(CopyBuffer(hEMA, 0, 0, 2, emaV) < 2) { if(EnableTestMode) Print("ENTRY WARN: EMA buf fail."); IndicatorRelease(hEMA); return; }
+    if(CopyBuffer(rsiHandle, 0, 0, 1, rsiV) < 1) { if(EnableTestMode) Print("ENTRY WARN: RSI buf fail."); IndicatorRelease(hEMA); return; }
+
+    double dynSlope = 0.00008, atrRaw = 0.0, maxDist = 0.0;
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrV) == 1)
+    { atrRaw = atrV[0]; dynSlope = atrRaw * 0.04; maxDist = atrRaw * 1.5; }
+
+    double curPrice  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double slope     = MathAbs(emaV[0] - emaV[1]);
+    double delta     = emaV[0] - emaV[1];
+    double peDist    = MathAbs(curPrice - emaV[0]);
+
+    bool emaRising   = (delta > 0.0);
+    bool emaFalling  = (delta < 0.0);
+    bool aboveEMA    = (curPrice > emaV[0]);
+    bool belowEMA    = (curPrice < emaV[0]);
+
+    // STEP 3: Regime branches
+    // Use int sentinel to avoid (ENUM_ORDER_TYPE)-1 compile error
+    int decidedDir = -1;   // -1=no signal, 0=BUY, 1=SELL
+
+    // ---------------------------------------------------------------
+    // TREND REGIME (CMI >= 20): H1 context + M1 trigger
+    // ---------------------------------------------------------------
+    if(isTrend)
     {
-        // CalculateCMI() already logged the error; wait for valid data
-        return;
-    }
+        bool slopeOK   = (slope >= dynSlope);
+        bool notChase  = (maxDist <= 0.0 || peDist <= maxDist);
+        bool rsiBuy    = (rsiV[0] >= 48.0 && rsiV[0] <= 68.0);
+        bool rsiSell   = (rsiV[0] >= 32.0 && rsiV[0] <= 52.0);
 
-    // Update global regime state (used elsewhere for diagnostics)
-    g_lastCMI = cmi;
+        bool h1Buy  = (aboveEMA && emaRising  && rsiBuy  && slopeOK && notChase);
+        bool h1Sell = (belowEMA && emaFalling && rsiSell && slopeOK && notChase);
 
-    bool isTrendRegime = (cmi >= 20.0);
-    bool isSwingRegime = (cmi <  20.0);
-    g_marketRegime = isTrendRegime ? "TREND" : "SWING";
+        int m1Sig = 0;
+        if(h1Buy || h1Sell) m1Sig = GetM1MicrotradingSignal();
 
-    // ------------------------------------------------------------------
-    // STEP 2 — Build the H1 context indicators
-    //          (EMA, RSI, ATR — same as original, just re-purposed)
-    // ------------------------------------------------------------------
+        bool tBuy  = (h1Buy  && m1Sig ==  1);
+        bool tSell = (h1Sell && m1Sig == -1);
 
-    // Local H1 EMA handle — same multi-TF pattern as original
-    int signalEmaHandle = iMA(_Symbol, EMAPeriodTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
-    if(signalEmaHandle == INVALID_HANDLE)
-    {
-        Print("⚠️ PATCH3-ENTRY: Failed to create H1 EMA handle. Skipping.");
-        return;
-    }
-
-    double emaValue[], rsiValue[], atrValue[];
-    ArraySetAsSeries(emaValue, true);
-    ArraySetAsSeries(rsiValue, true);
-    ArraySetAsSeries(atrValue, true);
-
-    if(CopyBuffer(signalEmaHandle, 0, 0, 2, emaValue) < 2)
-    {
-        if(EnableTestMode) Print("⚠️ PATCH3-ENTRY: EMA buffer copy failed.");
-        IndicatorRelease(signalEmaHandle);
-        return;
-    }
-    if(CopyBuffer(rsiHandle, 0, 0, 1, rsiValue) < 1)
-    {
-        if(EnableTestMode) Print("⚠️ PATCH3-ENTRY: RSI buffer copy failed.");
-        IndicatorRelease(signalEmaHandle);
-        return;
-    }
-
-    double dynamicMinSlope = 0.00008; // ATR-based fallback
-    double atrVal          = 0.0;
-    double maxEntryDistance = 0.0;
-
-    if(CopyBuffer(atrHandle, 0, 0, 1, atrValue) == 1)
-    {
-        atrVal           = atrValue[0];
-        dynamicMinSlope  = atrVal * 0.04; // same tuning as original
-        maxEntryDistance = atrVal * 1.5;
-    }
-
-    double currentPrice    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double emaSlope        = MathAbs(emaValue[0] - emaValue[1]);
-    double emaDelta        = emaValue[0] - emaValue[1];   // signed
-    double priceEmaDistance = MathAbs(currentPrice - emaValue[0]);
-
-    bool emaRising  = (emaDelta > 0.0);
-    bool emaFalling = (emaDelta < 0.0);
-    bool priceAboveEMA = (currentPrice > emaValue[0]);
-    bool priceBelowEMA = (currentPrice < emaValue[0]);
-
-    // ------------------------------------------------------------------
-    // STEP 3 — REGIME BRANCH
-    // ------------------------------------------------------------------
-
-    ENUM_ORDER_TYPE decidedDirection = (ENUM_ORDER_TYPE)-1;
-
-    // ==================================================================
-    //  BRANCH A — TREND REGIME (CMI ≥ 20)
-    //  Strategy: Trend-Following with M1 precision entry
-    // ==================================================================
-    if(isTrendRegime)
-    {
-        // ── H1 Context Filter ──────────────────────────────────────────
-        // The EMA slope must be meaningful (ATR-based dynamic threshold).
-        // Prevents trading on a visually "trending" CMI during news spikes
-        // where the close moved far but the EMA is still flat.
-        bool h1SlopeOK        = (emaSlope >= dynamicMinSlope);
-        bool priceNotChasing  = (maxEntryDistance <= 0.0 || priceEmaDistance <= maxEntryDistance);
-
-        // RSI zones — symmetric, no overlap (identical to Patch 11B original)
-        bool rsiInBuyZone     = (rsiValue[0] >= 48.0 && rsiValue[0] <= 68.0);
-        bool rsiInSellZone    = (rsiValue[0] >= 32.0 && rsiValue[0] <= 52.0);
-
-        // H1 BUY context: price above EMA, EMA rising, RSI in buy zone
-        bool h1BuyContext  = (priceAboveEMA && emaRising  && rsiInBuyZone  && h1SlopeOK && priceNotChasing);
-        // H1 SELL context: price below EMA, EMA falling, RSI in sell zone
-        bool h1SellContext = (priceBelowEMA && emaFalling && rsiInSellZone && h1SlopeOK && priceNotChasing);
-
-        // ── M1 Microtrading Signal (Patch 4) ──────────────────────────
-        // Only query the M1 layer when the H1 context is already aligned.
-        // This avoids burning CPU on M1 reads when the higher TF says NO.
-        int m1Signal = 0;
-
-        if(h1BuyContext || h1SellContext)
-        {
-            m1Signal = GetM1MicrotradingSignal();
-        }
-
-        // ── Confluence Gate ────────────────────────────────────────────
-        // BOTH H1 context AND M1 trigger must agree.
-        bool trendBuy  = (h1BuyContext  && m1Signal ==  1);
-        bool trendSell = (h1SellContext && m1Signal == -1);
-
-        // Diagnostic log (rate-limited)
-        datetime currentMinute = GetCurrentMinute();
-        static datetime lastTrendLog = 0;
-        if(currentMinute != lastTrendLog || EnableTestMode)
+        static datetime tLog = 0;
+        if(TimeCurrent()-tLog >= 60 || EnableTestMode)
         {
             if(ShowAllConditions || EnableTestMode)
             {
-                Print("\n═══════════════ TREND REGIME SIGNAL CHECK (CMI=",
-                      DoubleToString(cmi, 1), ") ═══════════════");
-                Print("H1 EMA: ", DoubleToString(emaValue[0], 5),
-                      " | Slope: ", DoubleToString(emaSlope, 6),
-                      " | MinSlope: ", DoubleToString(dynamicMinSlope, 6));
-                Print("Price: ", DoubleToString(currentPrice, 5),
-                      " | RSI: ", DoubleToString(rsiValue[0], 1));
-                Print("H1 BUY context:  ", h1BuyContext  ? "✓" : "✗");
-                Print("H1 SELL context: ", h1SellContext ? "✓" : "✗");
-                Print("M1 Signal: ", (m1Signal ==  1 ? "BUY" :
-                                     (m1Signal == -1 ? "SELL" : "NONE")));
-                Print("Trend BUY confluence:  ", trendBuy  ? "✅ FIRE" : "✗");
-                Print("Trend SELL confluence: ", trendSell ? "✅ FIRE" : "✗");
-                Print("════════════════════════════════════════════════════════\n");
+                Print("=== TREND CHECK (CMI=", DoubleToString(cmi,1), ") ===");
+                Print("EMA=", DoubleToString(emaV[0],5), " Slope=", DoubleToString(slope,6), " Min=", DoubleToString(dynSlope,6));
+                Print("RSI=", DoubleToString(rsiV[0],1), " H1Buy=", h1Buy, " H1Sell=", h1Sell);
+                Print("M1=", (m1Sig==1?"BUY":m1Sig==-1?"SELL":"NONE"), " TrendBUY=", tBuy, " TrendSELL=", tSell);
             }
-            lastTrendLog = currentMinute;
+            tLog = TimeCurrent();
         }
 
-        // ── Direction Decision ─────────────────────────────────────────
-        if(trendBuy && !trendSell)
-        {
-            decidedDirection = ORDER_TYPE_BUY;
-        }
-        else if(trendSell && !trendBuy)
-        {
-            decidedDirection = ORDER_TYPE_SELL;
-        }
-        else if(trendBuy && trendSell)
-        {
-            Print("⚠️ TREND: Direction conflict — both signals active. NO TRADE.");
-            IndicatorRelease(signalEmaHandle);
-            return;
-        }
-        // else: no signal — fall through to release and return below
+        if(tBuy  && !tSell) decidedDir = 0;
+        else if(tSell && !tBuy) decidedDir = 1;
+        else if(tBuy && tSell) { Print("TREND: Conflict. NO TRADE."); IndicatorRelease(hEMA); return; }
     }
 
-    // ==================================================================
-    //  BRANCH B — SWING REGIME (CMI < 20)
-    //  Strategy: Mean Reversion
-    //
-    //  Logic: We expect price to snap back toward the H1 EMA.
-    //  Entry conditions (deliberately tighter than trend entries to
-    //  reduce false signals in inherently noisy choppy conditions):
-    //
-    //  BUY (oversold snap-back):
-    //    price is BELOW EMA (diverged)
-    //    AND price is overextended downward (>= 1.5×ATR from EMA)
-    //    AND EMA slope is FLAT (momentum absent — reversion likely)
-    //    AND RSI is in oversold zone (25–42)
-    //
-    //  SELL (overbought snap-back):
-    //    price is ABOVE EMA (diverged)
-    //    AND price is overextended upward (>= 1.5×ATR from EMA)
-    //    AND EMA slope is FLAT (momentum absent)
-    //    AND RSI is in overbought zone (58–75)
-    //
-    //  NOTE: In a true Mean-Reversion system the EMA should be FLAT,
-    //  so we invert the slope gate: slope must be BELOW the dynamic
-    //  threshold (i.e., the EMA is not strongly trending).
-    // ==================================================================
-    else if(isSwingRegime)
+    // ---------------------------------------------------------------
+    // SWING REGIME (CMI < 20): Mean Reversion
+    // ---------------------------------------------------------------
+    else if(isSwing)
     {
-        // Flat EMA = slope below the dynamic threshold
-        bool emaIsFlat        = (emaSlope < dynamicMinSlope);
+        bool emaFlat   = (slope < dynSlope);
+        double oeThr   = (atrRaw > 0.0) ? atrRaw * 1.5 : 15.0 * SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0;
+        bool overext   = (peDist >= oeThr);
+        bool oversold  = (rsiV[0] >= 25.0 && rsiV[0] <= 42.0);
+        bool overbought= (rsiV[0] >= 58.0 && rsiV[0] <= 75.0);
 
-        // Overextended: price has moved at least 1.5×ATR from EMA
-        // (If ATR is unavailable use a fixed fallback of 15 pips)
-        double overextendThreshold = (atrVal > 0.0) ? (atrVal * 1.5)
-                                                     : (15.0 * SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10.0);
-        bool priceOverextended = (priceEmaDistance >= overextendThreshold);
+        // BUY snap-back: price too far BELOW EMA, RSI oversold
+        bool sBuy  = (belowEMA && overext && emaFlat && oversold);
+        // SELL snap-back: price too far ABOVE EMA, RSI overbought
+        bool sSell = (aboveEMA && overext && emaFlat && overbought);
 
-        // RSI zones for mean reversion — narrower extreme zones
-        bool rsiOversold    = (rsiValue[0] >= 25.0 && rsiValue[0] <= 42.0);
-        bool rsiOverbought  = (rsiValue[0] >= 58.0 && rsiValue[0] <= 75.0);
-
-        // BUY snap-back: price too far below EMA, expect recovery upward
-        bool swingBuy  = (priceBelowEMA && priceOverextended && emaIsFlat && rsiOversold);
-        // SELL snap-back: price too far above EMA, expect compression downward
-        bool swingSell = (priceAboveEMA && priceOverextended && emaIsFlat && rsiOverbought);
-
-        // Diagnostic log
-        datetime currentMinute = GetCurrentMinute();
-        static datetime lastSwingLog = 0;
-        if(currentMinute != lastSwingLog || EnableTestMode)
+        static datetime sLog = 0;
+        if(TimeCurrent()-sLog >= 60 || EnableTestMode)
         {
             if(ShowAllConditions || EnableTestMode)
             {
-                Print("\n═══════════════ SWING REGIME SIGNAL CHECK (CMI=",
-                      DoubleToString(cmi, 1), ") ═══════════════");
-                Print("H1 EMA: ", DoubleToString(emaValue[0], 5),
-                      " | Slope: ", DoubleToString(emaSlope, 6),
-                      " | Flat threshold: ", DoubleToString(dynamicMinSlope, 6));
-                Print("Price dist from EMA: ", DoubleToString(priceEmaDistance, 5),
-                      " | Overext threshold: ", DoubleToString(overextendThreshold, 5));
-                Print("RSI: ", DoubleToString(rsiValue[0], 1));
-                Print("EMA flat: ",       emaIsFlat       ? "✓" : "✗");
-                Print("Overextended: ",   priceOverextended ? "✓" : "✗");
-                Print("Swing BUY:  RSI oversold  (25-42): ", rsiOversold   ? "✓" : "✗",
-                      " | priceBelowEMA: ", priceBelowEMA ? "✓" : "✗");
-                Print("Swing SELL: RSI overbought(58-75): ", rsiOverbought ? "✓" : "✗",
-                      " | priceAboveEMA: ", priceAboveEMA ? "✓" : "✗");
-                Print("SWING BUY RESULT:  ", swingBuy  ? "✅ FIRE" : "✗");
-                Print("SWING SELL RESULT: ", swingSell ? "✅ FIRE" : "✗");
-                Print("════════════════════════════════════════════════════════\n");
+                Print("=== SWING CHECK (CMI=", DoubleToString(cmi,1), ") ===");
+                Print("Flat=", emaFlat, " Overext=", overext, " Dist=", DoubleToString(peDist,5), " Thr=", DoubleToString(oeThr,5));
+                Print("RSI=", DoubleToString(rsiV[0],1), " Oversold=", oversold, " Overbought=", overbought);
+                Print("SwingBUY=", sBuy, " SwingSELL=", sSell);
             }
-            lastSwingLog = currentMinute;
+            sLog = TimeCurrent();
         }
 
-        // Direction decision
-        if(swingBuy && !swingSell)
-        {
-            decidedDirection = ORDER_TYPE_BUY;
-        }
-        else if(swingSell && !swingBuy)
-        {
-            decidedDirection = ORDER_TYPE_SELL;
-        }
-        else if(swingBuy && swingSell)
-        {
-            Print("⚠️ SWING: Direction conflict. NO TRADE.");
-            IndicatorRelease(signalEmaHandle);
-            return;
-        }
+        if(sBuy  && !sSell) decidedDir = 0;
+        else if(sSell && !sBuy) decidedDir = 1;
+        else if(sBuy && sSell) { Print("SWING: Conflict. NO TRADE."); IndicatorRelease(hEMA); return; }
     }
 
-    // ------------------------------------------------------------------
-    // STEP 4 — Handle no-signal case
-    // ------------------------------------------------------------------
-    if(decidedDirection == (ENUM_ORDER_TYPE)-1)
+    // STEP 4: No signal
+    if(decidedDir == -1)
     {
-        // No signal in either regime — log once per minute in normal mode
-        static datetime lastNoSigLog = 0;
-        datetime currentMinute = GetCurrentMinute();
-        if(currentMinute != lastNoSigLog)
+        static datetime nsLog = 0;
+        if(TimeCurrent()-nsLog >= 60)
         {
-            if(!EnableTestMode)
-                Print("Direction: NONE [", g_marketRegime, " regime | CMI=",
-                      DoubleToString(cmi, 1), "]");
-            lastNoSigLog = currentMinute;
+            if(!EnableTestMode) Print("Direction: NONE [", g_marketRegime, " CMI=", DoubleToString(cmi,1), "]");
+            nsLog = TimeCurrent();
         }
-        IndicatorRelease(signalEmaHandle);
+        IndicatorRelease(hEMA);
         return;
     }
 
-    // ------------------------------------------------------------------
-    // STEP 5 — Valid signal — log it and execute
-    // ------------------------------------------------------------------
-    Print("\n╔══════════════════════════════════════════════════════════╗");
-    Print("║ VALID SIGNAL: ", EnumToString(decidedDirection),
-          " [", g_marketRegime, " | CMI=", DoubleToString(cmi, 1), "]   ║");
-    Print("╠══════════════════════════════════════════════════════════╣");
-    if(decidedDirection == ORDER_TYPE_BUY)
+    // STEP 5: Signal confirmed
+    // Cast to ENUM_ORDER_TYPE ONLY here (avoids compile error)
+    ENUM_ORDER_TYPE dir = (decidedDir == 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+    Print("VALID SIGNAL: ", EnumToString(dir), " [", g_marketRegime, " CMI=", DoubleToString(cmi,1), "]",
+          " Price=", DoubleToString(curPrice,5), " EMA=", DoubleToString(emaV[0],5), " RSI=", DoubleToString(rsiV[0],1));
+
+    OpenTrade(dir);
+
+    if(PositionSelect(_Symbol)) lastBarTime = curBarTime;
+
+    IndicatorRelease(hEMA);
+}
+
+//=== OPEN TRADE ====================================================
+
+void OpenTrade(ENUM_ORDER_TYPE ot)
+{
+    double price  = (ot == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double pt     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    int    dg     = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double pv     = (dg == 3 || dg == 5) ? pt * 10.0 : pt;
+
+    double lots   = CalculateLotSize(StopLossPips);
+
+    if(lots <= 0)
+    { Print("CRITICAL: Lot=0 — ABORTED"); NotifyUser("CRITICAL: Lot=0. Trade blocked."); consecutiveErrors++; return; }
+    if(lots > SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX))
+    { Print("CRITICAL: Lot > VOLUME_MAX — ABORTED"); NotifyUser("CRITICAL: Lot>max. Trade blocked."); consecutiveErrors++; return; }
+
+    double sl = (ot == ORDER_TYPE_BUY) ? price - (adaptedStopLoss   * pv) : price + (adaptedStopLoss   * pv);
+    double tp = (ot == ORDER_TYPE_BUY) ? price + (adaptedTakeProfit * pv) : price - (adaptedTakeProfit * pv);
+    sl = NormalizeDouble(sl, dg); tp = NormalizeDouble(tp, dg);
+
+    if((TimeCurrent() - lastTradeTime) < 10) { Print("SAFETY ABORT: 10s cooldown."); return; }
+    if(!CheckSlippage(ot, price))            { Print("SAFETY ABORT: Slippage.");     return; }
+    if(!CheckMarginSufficiency(ot, lots))    { Print("SAFETY ABORT: Margin.");        return; }
+    if(!CheckFreeMarginBuffer(lots))         { Print("SAFETY ABORT: Margin buffer."); return; }
+    if(!ValidateStopLevels(ot, price, sl, tp)) { Print("SAFETY ABORT: Stop levels."); return; }
+
+    Print("=== OPENING ", EnumToString(ot), " Lot:", lots, " Entry:", price, " SL:", sl, " TP:", tp);
+
+    if(trade.PositionOpen(_Symbol, ot, lots, price, sl, tp, TradeComment))
     {
-        Print("║ BUY  | Price: ", DoubleToString(currentPrice, 5),
-              " > EMA: ", DoubleToString(emaValue[0], 5), "          ║");
-        Print("║ EMA delta: +", DoubleToString(emaDelta, 6),
-              " | RSI: ", DoubleToString(rsiValue[0], 1), "              ║");
+        Print("Trade opened. Ticket:", trade.ResultOrder());
+        lastTradeTime = TimeCurrent(); tradesThisDay++;
+        Sleep(100); VerifyTradeIntegrity(ot, sl, tp);
+        consecutiveErrors = 0;
     }
     else
+    { Print("Trade FAILED. ", trade.ResultRetcodeDescription()); RecordExecutionError(); }
+}
+
+//===================================================================
+// PATCH 1 - CalculateLotSize()  [FULL REPLACEMENT]
+//
+// USC/Cent-account aware. Key changes:
+//  1. 0.50% hard cap enforced unconditionally inside this function.
+//  2. Strict MathFloor() downward truncation — NO MathMax() fallback.
+//  3. If truncatedLot < SYMBOL_VOLUME_MIN -> return 0 (hard abort).
+//     OpenTrade() catches 0 and aborts. NO silent fallback to minLot.
+//===================================================================
+
+double CalculateLotSize(double stopLossPips)
+{
+    // Hard cap 0.50% — USC cent-account safety
+    const double CAP = 0.50;
+    double eRisk = MathMin(activeRiskPercent, CAP);
+    if(activeRiskPercent > CAP)
+        Print("P1-WARN: Risk capped ", DoubleToString(activeRiskPercent,3), "% -> ", CAP, "%");
+
+    double effSL  = (adaptedStopLoss > 0.0) ? adaptedStopLoss : stopLossPips;
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    if(equity <= 0.0) { Print("P1-CRITICAL: equity=", equity, " ABORTED."); return 0.0; }
+
+    double riskAmt = equity * (eRisk / 100.0);
+
+    int    dg    = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double pt    = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double pipSz = (dg == 3 || dg == 5) ? pt * 10.0 : pt;
+
+    double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickVal <= 0.0 || tickSize <= 0.0) { Print("P1-CRITICAL: Bad tick params. ABORTED."); return 0.0; }
+
+    double pipValPerLot = (tickVal / tickSize) * pipSz;
+    if(pipValPerLot <= 0.0) { Print("P1-CRITICAL: pipValPerLot=", pipValPerLot, " ABORTED."); return 0.0; }
+
+    double rawLot = riskAmt / (effSL * pipValPerLot);
+
+    // STRICT DOWNWARD TRUNCATION — prevents broker rounding from over-leveraging
+    double tLot = MathFloor(rawLot / brokerLotStep) * brokerLotStep;
+
+    if(EnableTestMode)
+        Print("P1-CALC: eq=", DoubleToString(equity,2), " risk=", DoubleToString(eRisk,3),
+              "% riskAmt=", DoubleToString(riskAmt,4), " raw=", DoubleToString(rawLot,6),
+              " truncated=", DoubleToString(tLot,4));
+
+    // HARD BLOCK — no silent fallback to brokerMinLot
+    double volMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    if(tLot < volMin)
     {
-        Print("║ SELL | Price: ", DoubleToString(currentPrice, 5),
-              " < EMA: ", DoubleToString(emaValue[0], 5), "          ║");
-        Print("║ EMA delta: ", DoubleToString(emaDelta, 6),
-              " | RSI: ", DoubleToString(rsiValue[0], 1), "              ║");
+        double riskIfMin = (volMin * effSL * pipValPerLot / equity) * 100.0;
+        Print("P1-CRITICAL: truncated(", DoubleToString(tLot,4), ") < minLot(", DoubleToString(volMin,4), ")");
+        Print("  IntendedRisk:", DoubleToString(eRisk,3), "% | RiskIfMinForced:", DoubleToString(riskIfMin,2), "% — ABORTED");
+        NotifyUser("CRITICAL: Lot below min. Equity:" + DoubleToString(equity,2) + ". Trade blocked.");
+        return 0.0;
     }
-    Print("╚══════════════════════════════════════════════════════════╝\n");
 
-    // Execute via existing OpenTrade() (unchanged — keeps all safety checks)
-    OpenTrade(decidedDirection);
+    double finalLot = NormalizeDouble(MathMin(tLot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)), 2);
+    double actRisk  = (finalLot * effSL * pipValPerLot / equity) * 100.0;
+    Print("P1-LOT OK:", DoubleToString(finalLot,2), " lots | ActualRisk:", DoubleToString(actRisk,3), "%");
+    return finalLot;
+}
 
-    // Commit direction if position was actually opened
-    if(PositionSelect(_Symbol))
+//=== MANAGE POSITION ===============================================
+
+void ManagePosition() { return; }
+
+//=== CHECK CLOSED POSITION =========================================
+
+void CheckClosedPosition()
+{
+    if(TimeCurrent() == lastHistoryCheck) return;
+    lastHistoryCheck = TimeCurrent();
+    if(!HistorySelect(TimeCurrent()-60, TimeCurrent())) return;
+    int cur = HistoryDealsTotal();
+    if(cur <= lastHistoryTotal) return;
+
+    for(int i = lastHistoryTotal; i < cur; i++)
     {
-        committedDirection = decidedDirection;
+        ulong tk = HistoryDealGetTicket(i);
+        if(tk == 0) continue;
+        if(HistoryDealGetInteger(tk, DEAL_MAGIC) != MagicNumber) continue;
+        if(HistoryDealGetInteger(tk, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+
+        double profit = HistoryDealGetDouble(tk, DEAL_PROFIT);
+        if(profit < 0)
+        {
+            consecutiveLosses++;
+            if(consecutiveLosses >= ConsecutiveLossLimit)
+            {
+                activeRiskPercent = RiskPercentPerTrade * 0.5;
+                int cm = (int)MathMin(PauseAfterLossMinutes + ((consecutiveLosses - ConsecutiveLossLimit) * 30), 180);
+                pauseUntil = TimeCurrent() + (cm * 60);
+                NotifyUser("LOSS PROTECT: " + IntegerToString(consecutiveLosses) + " losses. Risk->" + DoubleToString(activeRiskPercent,2) + "% Cooldown:" + IntegerToString(cm) + "min");
+                consecutiveLosses = 0;
+            }
+        }
+        else if(profit > 0)
+        {
+            consecutiveLosses = 0;
+            if(activeRiskPercent < RiskPercentPerTrade && !conservativeMode)
+            { activeRiskPercent = RiskPercentPerTrade; Print("Risk restored:", DoubleToString(activeRiskPercent,2), "%"); }
+        }
     }
+    lastHistoryTotal = cur;
+    CheckProtectionLimits();
+}
 
-    // Mark bar as processed
-    lastSignalBarTime = currentBarTime;
+//=== CHECK PROTECTION LIMITS =======================================
 
-    // ------------------------------------------------------------------
-    // CRITICAL: Release the local H1 EMA handle to prevent memory leaks
-    // ------------------------------------------------------------------
-    IndicatorRelease(signalEmaHandle);
+void CheckProtectionLimits()
+{
+    double bal   = AccountInfoDouble(ACCOUNT_BALANCE);
+    double dLim  = GetEffectiveDailyLossLimit();
+    double wLim  = GetEffectiveWeeklyLossLimit();
+
+    if((bal - dailyStartBalance) <= -(dailyStartBalance * dLim / 100.0) && !dailyLossHit)
+    { dailyLossHit = true; NotifyUser("Daily loss limit hit -" + DoubleToString(dLim,1) + "%."); }
+
+    if((bal - weeklyStartBalance) <= -(weeklyStartBalance * wLim / 100.0) && !weeklyLossHit)
+    { weeklyLossHit = true; NotifyUser("Weekly loss limit hit -" + DoubleToString(wLim,1) + "%."); }
+
+    double wTarget = weeklyStartBalance * (WeeklyProfitTargetPercent / 100.0);
+    if((bal - weeklyStartBalance) >= wTarget && !weeklyTargetReached)
+    {
+        if(!PositionSelect(_Symbol))
+        {
+            if(weeklyTargetReachedTime == 0) weeklyTargetReachedTime = TimeCurrent();
+            if((int)((TimeCurrent()-weeklyTargetReachedTime)/60) >= TargetStabilityMinutes)
+            { weeklyTargetReached = true; NotifyUser("Weekly target reached. Trading paused."); weeklyTargetReachedTime = 0; }
+        }
+        else weeklyTargetReachedTime = 0;
+    }
+    else weeklyTargetReachedTime = 0;
+}
+
+//=== DEPRECATED STUB ===============================================
+void DetectWithdrawal() { return; }
+
+//=== CONSERVATIVE MODE =============================================
+
+void ManageConservativeMode()
+{
+    double eq = AccountInfoDouble(ACCOUNT_EQUITY), bal = AccountInfoDouble(ACCOUNT_BALANCE);
+    if(eq > MaxEquityRange && !conservativeMode)
+    {
+        conservativeMode = true; conservativeModeThreshold = MaxEquityRange;
+        double m = bal / MaxEquityRange;
+        if(m > 2.0) activeRiskPercent = RiskPercentPerTrade * 0.25;
+        else if(m > 1.5) activeRiskPercent = RiskPercentPerTrade * 0.4;
+        else activeRiskPercent = RiskPercentPerTrade * 0.5;
+        activeMaxTradesPerDay = (int)MathMax(MaxTradesPerDay * 0.5, 3);
+        NotifyUser("Conservative mode ON. Risk:" + DoubleToString(activeRiskPercent,2) + "%");
+    }
+    if(conservativeMode && eq < conservativeModeThreshold * 0.70)
+    {
+        conservativeMode = false; activeRiskPercent = RiskPercentPerTrade;
+        activeMaxTradesPerDay = MaxTradesPerDay; conservativeModeThreshold = 0;
+        NotifyUser("Conservative mode OFF. Risk restored:" + DoubleToString(activeRiskPercent,2) + "%");
+    }
+}
+
+//=== SMALL ACCOUNT MODE ============================================
+
+void CheckAndApplySmallAccountMode()
+{
+    datetime cm = GetCurrentMinute();
+    if(cm == lastSmallAccountCheck && lastSmallAccountCheck != 0) return;
+    lastSmallAccountCheck = cm;
+    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+
+    if(!smallAccountModeActive && EnableSmallAccountMode && bal < SmallAccountThreshold)
+    { smallAccountModeActive = true; activeRiskPercent = SmallAccountRiskPercent; activeMaxTradesPerDay = SmallAccountMaxTrades; NotifyUser("Small Acct Mode ON. $" + DoubleToString(bal,2)); }
+
+    if(smallAccountModeActive && bal >= SmallAccountExitThreshold)
+    { smallAccountModeActive = false; activeRiskPercent = originalRiskPercent; activeMaxTradesPerDay = originalMaxTrades; NotifyUser("Small Acct Mode OFF. $" + DoubleToString(bal,2)); }
+
+    if(!smallAccountModeActive && EnableSmallAccountMode && bal < SmallAccountThreshold && bal >= MinEquityRange)
+    { smallAccountModeActive = true; activeRiskPercent = SmallAccountRiskPercent; activeMaxTradesPerDay = SmallAccountMaxTrades; NotifyUser("Small Acct Mode RE-ACTIVATED."); }
+}
+
+double GetEffectiveDailyLossLimit()  { return smallAccountModeActive ? SmallAccountDailyLoss  : MaxDailyLossPercent;  }
+double GetEffectiveWeeklyLossLimit() { return smallAccountModeActive ? SmallAccountWeeklyLoss : MaxWeeklyLossPercent; }
+double GetEffectiveMinWithdrawal()   { return smallAccountModeActive ? SmallAccountMinWithdrawal : AccountInfoDouble(ACCOUNT_BALANCE) * (WithdrawalThresholdPercent/100.0); }
+
+//=== TIME UTILITIES ================================================
+
+void CheckTimeResets()
+{
+    datetime ds = GetDayStart(), ws = GetWeekStart();
+    if(ds > dailyResetTime)
+    { dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE); dailyResetTime = ds; tradesThisDay = 0; dailyLossHit = false; consecutiveLosses = 0; lastKnownBalance = dailyStartBalance; Print("Daily Reset. Bal:$", DoubleToString(dailyStartBalance,2)); }
+    if(ws > weeklyResetTime)
+    { weeklyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE); weeklyResetTime = ws; weeklyLossHit = false; weeklyTargetReached = false; weeklyTargetReachedTime = 0; lastKnownBalance = weeklyStartBalance; Print("Weekly Reset. Bal:$", DoubleToString(weeklyStartBalance,2)); }
+}
+
+datetime GetDayStart()
+{ MqlDateTime dt; TimeToStruct(TimeCurrent(), dt); dt.hour=0; dt.min=0; dt.sec=0; return StructToTime(dt); }
+
+datetime GetWeekStart()
+{ MqlDateTime dt; TimeToStruct(TimeCurrent(), dt); int s=(dt.day_of_week==0)?6:dt.day_of_week-1; datetime m=TimeCurrent()-(s*86400); TimeToStruct(m,dt); dt.hour=0; dt.min=0; dt.sec=0; return StructToTime(dt); }
+
+datetime GetCurrentMinute()
+{ MqlDateTime dt; TimeToStruct(TimeCurrent(), dt); dt.sec=0; return StructToTime(dt); }
+
+void NotifyUser(string msg) { string f="[CapPreserve] "+msg; SendNotification(f); Print(f); }
+
+//=== COOLDOWN & SPREAD SPIKE =======================================
+
+bool CheckExecutionCooldown()
+{
+    int s = (int)(TimeCurrent() - lastTradeTime);
+    if(s < MinSecondsBetweenTrades)
+    { static datetime l=0; if(TimeCurrent()-l>60){ Print("COOLDOWN: Wait ", MinSecondsBetweenTrades-s, "s."); l=TimeCurrent(); } return false; }
+    return true;
+}
+
+void DetectSpreadSpike()
+{
+    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK), bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+    double pt=SymbolInfoDouble(_Symbol,SYMBOL_POINT); int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+    double pv=(dg==3||dg==5)?pt*10.0:pt; int sp=(int)((ask-bid)/pv);
+    if(lastSpread==0){lastSpread=sp;return;}
+    if(sp>(lastSpread*2.5)&&sp>PreferredSpreadPoints&&TimeCurrent()-spreadSpikeDetectedTime>1800)
+    { pauseUntil=MathMax(pauseUntil,TimeCurrent()+1800); spreadSpikeDetectedTime=TimeCurrent(); NotifyUser("SPREAD SPIKE:"+IntegerToString(sp)+" pts. 30-min pause."); }
+    lastSpread=sp;
+}
+
+//=== ACCOUNT FLOOR =================================================
+
+void CheckAccountFloor()
+{
+    if(accountFloorHit && !softRearmActive) return;
+    if(RequireManualResetAfterFloor && !softRearmActive)
+    {
+        if(GlobalVariableCheck("AccountFloorHit_"+(string)((int)AccountInfoInteger(ACCOUNT_LOGIN))))
+        { accountFloorHit=true; Print("FLOOR LOCK ACTIVE."); return; }
+    }
+    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+    if(eq <= MinEquityRange)
+    {
+        if(softRearmActive) { softRearmActive=false; ultraConservativeMode=false; if(!conservativeMode){activeRiskPercent=RiskPercentPerTrade;activeMaxTradesPerDay=MaxTradesPerDay;} }
+        accountFloorHit=true; accountFloorHitTime=TimeCurrent();
+        if(RequireManualResetAfterFloor) GlobalVariableSet("AccountFloorHit_"+(string)((int)AccountInfoInteger(ACCOUNT_LOGIN)),1);
+        Alert("CRITICAL: ACCOUNT FLOOR HIT. Equity:$",DoubleToString(eq,2));
+        NotifyUser("CRITICAL: Floor hit. Trading halted.");
+        CheckSoftRearmConditions();
+    }
+}
+
+//=== DIAGNOSTIC LOGGING ============================================
+
+void PrintDailyDiagnostic()
+{
+    datetime today = GetDayStart();
+    if(today <= lastDiagnosticPrint) return;
+    lastDiagnosticPrint = today;
+    double bal=AccountInfoDouble(ACCOUNT_BALANCE), eq=AccountInfoDouble(ACCOUNT_EQUITY);
+    double wPnL=((bal-weeklyStartBalance)/weeklyStartBalance)*100.0;
+    Print("===== DAILY DIAGNOSTIC =====");
+    Print("Bal:$",DoubleToString(bal,2)," Eq:$",DoubleToString(eq,2));
+    Print("Risk:",DoubleToString(activeRiskPercent,2),"% ConservMode:",conservativeMode?"ON":"OFF");
+    Print("CMI Regime:",g_marketRegime," CMI=",DoubleToString(g_lastCMI,1));
+    Print("WeeklyPnL:",DoubleToString(wPnL,2),"% TodayTrades:",tradesThisDay);
+    Print("============================");
+}
+
+//=== EMERGENCY STOP ================================================
+
+void CheckEmergencyDrawdown()
+{
+    if(emergencyStopActive) return;
+    double dd=((initialEquity-AccountInfoDouble(ACCOUNT_EQUITY))/initialEquity)*100.0;
+    if(dd >= MaxEquityDrawdownPercent) ActivateEmergencyStop("Drawdown "+DoubleToString(dd,2)+"% > limit "+DoubleToString(MaxEquityDrawdownPercent,1)+"%");
+}
+
+void ActivateEmergencyStop(string reason)
+{
+    emergencyStopActive=true;
+    Alert("EMERGENCY STOP: ",reason);
+    for(int i=PositionsTotal()-1;i>=0;i--)
+    { ulong tk=PositionGetTicket(i); if(PositionSelectByTicket(tk)&&PositionGetInteger(POSITION_MAGIC)==MagicNumber) trade.PositionClose(tk); }
+    NotifyUser("EMERGENCY STOP: "+reason+" All positions closed. Restart required.");
+}
+
+//=== TRADE INTEGRITY ===============================================
+
+void VerifyTradeIntegrity(ENUM_ORDER_TYPE ot, double expSL, double expTP)
+{
+    if(!PositionSelect(_Symbol)) return;
+    double posSL=PositionGetDouble(POSITION_SL), posTP=PositionGetDouble(POSITION_TP);
+    ulong tk=PositionGetInteger(POSITION_TICKET); double pt=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+    if(posSL==0||posTP==0||MathAbs(posSL-expSL)/pt>10||MathAbs(posTP-expTP)/pt>10)
+    { Print("INTEGRITY FAIL: ticket ",tk," SL got:",posSL," exp:",expSL," TP got:",posTP," exp:",expTP); if(trade.PositionClose(tk)){NotifyUser("CRITICAL: Position closed — integrity fail.");RecordExecutionError();} }
+    else Print("Integrity OK: ticket ",tk);
+}
+
+//=== ERROR TRACKING ================================================
+
+void RecordExecutionError()
+{
+    consecutiveErrors++; lastErrorTime=TimeCurrent();
+    Print("Exec error #",consecutiveErrors);
+    if(consecutiveErrors>=MaxConsecutiveErrors) ActivateEmergencyStop("Consecutive errors ("+IntegerToString(consecutiveErrors)+")");
+    else if(consecutiveErrors>=MaxConsecutiveErrors/2) { pauseUntil=MathMax(pauseUntil,TimeCurrent()+1800); NotifyUser("WARNING: "+IntegerToString(consecutiveErrors)+" errors. 30min pause."); }
+}
+
+//=== SOFT RE-ARM ===================================================
+
+void CheckSoftRearmConditions()
+{
+    if(!SoftRearmAllowed||!accountFloorHit) return;
+    double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+    if(eq<30.0){Print("SOFT RE-ARM BLOCKED: Account too small ($",DoubleToString(eq,2),")");}
+    if((int)((TimeCurrent()-accountFloorHitTime)/60)<SoftRearmCooldownMinutes) return;
+    if(PositionSelect(_Symbol)) return;
+    double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+    if(MathAbs(eq-bal)>bal*0.005) return;
+    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK),bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+    double pt=SymbolInfoDouble(_Symbol,SYMBOL_POINT); int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+    double pv=(dg==3||dg==5)?pt*10.0:pt; int sp=(int)((ask-bid)/pv);
+    if(sp>PreferredSpreadPoints||!IsTradingTime()||eq<=MinEquityRange) return;
+    ActivateSoftRearm();
+}
+
+void ActivateSoftRearm()
+{
+    softRearmActive=true; ultraConservativeMode=true;
+    activeRiskPercent=RiskPercentPerTrade*0.25; activeMaxTradesPerDay=2;
+    accountFloorHit=false;
+    Print("SOFT RE-ARM ACTIVATED. Risk:",DoubleToString(activeRiskPercent,3),"% MaxTrades:",activeMaxTradesPerDay);
+    NotifyUser("SOFT RE-ARM: Recovery mode. Risk:"+DoubleToString(activeRiskPercent,3)+"%");
+}
+
+//=== NEWS FILTER ===================================================
+
+bool IsNewsEvent()
+{
+    datetime now=TimeCurrent(), st=now-(NewsPauseMinutesAfter*60), et=now+(NewsPauseMinutesBefore*60);
+    MqlCalendarValue vals[];
+    if(CalendarValueHistory(vals,st,et))
+    {
+        for(int i=0;i<ArraySize(vals);i++)
+        {
+            MqlCalendarEvent ev; MqlCalendarCountry co;
+            if(!CalendarEventById(vals[i].event_id,ev)||!CalendarCountryById(ev.country_id,co)) continue;
+            if(co.currency!="USD"&&co.currency!="EUR") continue;
+            if(ev.importance==CALENDAR_IMPORTANCE_HIGH) { Print("HIGH IMPACT NEWS: ",ev.name); return true; }
+            if(IncludeMediumImpact&&ev.importance==CALENDAR_IMPORTANCE_MODERATE) { Print("MEDIUM IMPACT NEWS: ",ev.name); return true; }
+        }
+    }
+    return false;
+}
+
+//=== TRAILING STOP =================================================
+
+void ApplyTrailingStop()
+{
+    if(!EnableTrailingStop||!PositionSelect(_Symbol)) return;
+    double cSL=PositionGetDouble(POSITION_SL), cTP=PositionGetDouble(POSITION_TP);
+    double op=PositionGetDouble(POSITION_PRICE_OPEN), cp=PositionGetDouble(POSITION_PRICE_CURRENT);
+    long   tp=(long)PositionGetInteger(POSITION_TYPE);
+    double pt=SymbolInfoDouble(_Symbol,SYMBOL_POINT); int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+    double ps=(dg==3||dg==5)?pt*10.0:pt;
+
+    if(tp==POSITION_TYPE_BUY)
+    {
+        double pp=(cp-op)/ps;
+        if(pp>TrailingStartPips)
+        { double nSL=cp-(TrailingDistPips*ps); if(nSL>(cSL+(TrailingStepPips*ps))) { nSL=NormalizeDouble(nSL,dg); trade.PositionModify(PositionGetInteger(POSITION_TICKET),nSL,cTP); Print("TRAIL BUY: SL->",nSL); } }
+    }
+    if(tp==POSITION_TYPE_SELL)
+    {
+        double pp=(op-cp)/ps;
+        if(pp>TrailingStartPips)
+        { double nSL=cp+(TrailingDistPips*ps); if(cSL==0||nSL<(cSL-(TrailingStepPips*ps))) { nSL=NormalizeDouble(nSL,dg); trade.PositionModify(PositionGetInteger(POSITION_TICKET),nSL,cTP); Print("TRAIL SELL: SL->",nSL); } }
+    }
 }
 
 //+------------------------------------------------------------------+
-//  END OF PATCH FILE
-//+------------------------------------------------------------------+
-//
-//  POST-INTEGRATION CHECKLIST
-//  ──────────────────────────
-//  [ ] Global variables block (Section A) added near existing handles
-//  [ ] InitializeMicrotradingIndicators() called at end of OnInit()
-//  [ ] DeinitMicrotradingIndicators()    called at start of OnDeinit()
-//  [ ] Old CalculateLotSize()  fully removed, replaced with Patch 1
-//  [ ] Old CheckForEntry()     fully removed, replaced with Patch 3
-//  [ ] CalculateCMI()          inserted as new function (Patch 2)
-//  [ ] GetM1MicrotradingSignal() inserted as new function (Patch 4)
-//  [ ] IsMarketTrending() call removed from CheckForEntry (deprecated)
-//  [ ] Compile: zero errors expected
-//  [ ] Backtest on M5/H1 chart against cent-account data
-//  [ ] Verify "PATCH1-LOT: 0.01 lots" appears in journal (not 0.00)
-//  [ ] Verify CMI log appears every 60s confirming SWING/TREND
-//  [ ] Verify M1 signal log appears in TREND regime
-//
+//  END OF FILE — Guardian_EURUSD_v2.mq5
 //+------------------------------------------------------------------+
