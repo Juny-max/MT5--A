@@ -1,282 +1,384 @@
 //+------------------------------------------------------------------+
-//|                   XAUUSDm_PrecisionScalper.mq5                   |
-//|          Elite Quantitative Precision Scalping EA for Gold        |
-//|          Optimized for Exness Standard Account | $110 Principal   |
-//|                                                                    |
-//|  ARCHITECTURE MODULES:                                             |
-//|    1. Capital Preservation & Harvest-Halt Protocol                 |
-//|    2. Macro-Trend Shield         (M15 Timeframe)                   |
-//|    3. Micro-Burst Execution Spear(M1  Timeframe)                   |
-//|    4. Dynamic Trailing Exit Matrix                                 |
-//|    5. Smart News Integration     (MT5 Economic Calendar API)       |
+//|          XAUUSDm_ForgeScalper_v2.mq5                             |
+//|          QuantForge Dual-Engine EA — Version 2.0                 |
+//|          Optimized for Exness Standard Account | XAUUSDm         |
+//|                                                                  |
+//|  ═══════════════════════════════════════════════════════════════ |
+//|  CHANGELOG from v1.0 (PrecisionScalper):                        |
+//|                                                                  |
+//|  FIX 1 — Signal Contradiction Resolved                          |
+//|           Removed MACD zero-zone requirement that made signals   |
+//|           almost impossible to fire in a trending market.        |
+//|                                                                  |
+//|  FIX 2 — Spread Filter Corrected                                |
+//|           Default tightened from 350 pts to 60 pts (6 pips),    |
+//|           appropriate for XAUUSD scalping on Exness.            |
+//|                                                                  |
+//|  FIX 3 — Dead Code Eliminated                                   |
+//|           ManagePosition() removed. ManageOpenPositions() is now |
+//|           the single unified position manager for ALL trades.    |
+//|                                                                  |
+//|  FIX 4 — Session Filter Added                                   |
+//|           Entries restricted to London/NY overlap 08:00-17:00   |
+//|           GMT to avoid low-liquidity Asian session noise.        |
+//|                                                                  |
+//|  FIX 5 — Dynamic Lot Sizing Added                               |
+//|           Lots now scale with equity using % risk model instead  |
+//|           of hardcoded 0.01 for both engines.                    |
+//|                                                                  |
+//|  FIX 6 — Duplicate Straddle Code Removed                        |
+//|           Only PlaceNetlessStraddle() (OrderSend version) kept.  |
+//|           trade.BuyStop/SellStop version deleted.                |
+//|                                                                  |
+//|  NEW — ENGINE 2: H1 Swing Trader Module                         |
+//|         Uses EMA21/50/200 trend alignment + RSI(14) pullback     |
+//|         recovery + MACD H1 confirmation + ATR(14) dynamic        |
+//|         SL/TP. Targets 300-600 pip moves for daily base income.  |
+//|                                                                  |
+//|  ARCHITECTURE:                                                   |
+//|    Module 1: Capital Preservation & Harvest-Halt Protocol        |
+//|    Module 2: M15 Macro-Trend Shield (Scalper gatekeeper)         |
+//|    Module 3: M1 Micro-Burst Execution Spear (Scalper engine)     |
+//|    Module 4: H1 Swing Trader (New income layer)                  |
+//|    Module 5: Unified Dynamic Trailing Exit Matrix                |
+//|    Module 6: News Integration + Netless Straddle                 |
+//|    Module 7: Session Filter (GMT 08:00-17:00)                    |
 //+------------------------------------------------------------------+
-#property copyright "Precision Scalper v1.0"
-#property version   "1.00"
+#property copyright "QuantForge v2.0"
+#property version   "2.00"
 #property strict
 
-//--- Standard MQL5 libraries
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\OrderInfo.mqh>
 
 //+------------------------------------------------------------------+
-//|  INPUT PARAMETERS                                                  |
+//|  INPUT PARAMETERS                                                 |
 //+------------------------------------------------------------------+
 
-//--- Capital & Risk Management
+//--- Capital & Risk
 input group "=== CAPITAL MANAGEMENT ==="
-input double   InpLotSize          = 0.01;    // Fixed lot size (min 0.01 for micro balance)
-input double   InpHardFloorEquity  = 55.00;   // Absolute equity floor ($) — NEVER trade below
-input double   InpInitialBalance   = 110.00;  // Initial account principal ($)
+input double InpInitialBalance   = 110.00;  // Starting account principal ($)
+input double InpHardFloorEquity  = 55.00;   // Absolute equity floor — halt & flatten below this
+input double InpScalperRiskPct   = 1.0;     // Scalper risk per trade (% of equity)
+input double InpSwingRiskPct     = 1.5;     // Swing risk per trade (% of equity)
+input double InpMinLotSize       = 0.01;    // Minimum lot size (broker floor)
+input double InpMaxLotSize       = 0.10;    // Maximum lot size (safety cap for micro accounts)
 
-//--- Harvest Targets (Fractional Step-Up)
+//--- Harvest Targets
 input group "=== HARVEST & HALT TARGETS ==="
-input double   InpHarvestTarget1   = 165.00;  // Harvest Step 1: Equity target ($)
-input double   InpHarvestTarget2   = 210.00;  // Harvest Step 2: Equity target ($)
-input double   InpHarvestTarget3   = 262.50;  // Harvest Step 3: Equity target ($)
+input double InpHarvestTarget1   = 165.00;  // Step 1: Equity target ($) — withdraw & restart
+input double InpHarvestTarget2   = 210.00;  // Step 2: Equity target ($)
+input double InpHarvestTarget3   = 262.50;  // Step 3: Equity target ($)
 
-//--- Spread & Slippage Guards
+//--- Execution Guards
 input group "=== SPREAD & EXECUTION GUARDS ==="
-input int      InpMaxSpreadPoints  = 350;     // Max spread in points (350 = 35 pips on 5-digit)
-input int      InpMaxSlippage      = 30;      // Max slippage in points
+input int    InpMaxSpreadPoints  = 60;      // Max spread in points (60 = 6 pips — tight for scalping)
+input int    InpMaxSlippage      = 30;      // Max slippage in points
 
-//--- M15 Macro-Trend Shield EMAs
-input group "=== M15 MACRO-TREND SHIELD ==="
-input int      InpEMA200Period     = 200;     // EMA 200 period
-input int      InpEMA60Period      = 60;      // EMA 60 period
-input int      InpEMA30Period      = 30;      // EMA 30 period
+//--- Session Filter
+input group "=== SESSION FILTER (GMT) ==="
+input bool   InpEnableSession    = true;    // Enable London/NY session filter
+input int    InpSessionStartHour = 8;       // Session open hour (GMT) — London open
+input int    InpSessionEndHour   = 17;      // Session close hour (GMT) — NY midday
+input bool   InpSwingAnySession  = true;    // Allow swing trades outside session (H1 signals)
 
-//--- M1 Bollinger Band Settings
-input group "=== M1 BOLLINGER BANDS ==="
-input int      InpFastBBPeriod     = 20;      // Fast BB period
-input double   InpFastBBDeviation  = 2.0;     // Fast BB standard deviation
-input int      InpSlowBBPeriod     = 100;     // Slow BB period
-input double   InpSlowBBDeviation  = 2.0;     // Slow BB standard deviation
+//--- ENGINE 1: M15 Macro-Trend Shield (Scalper)
+input group "=== ENGINE 1: M15 MACRO-TREND SHIELD ==="
+input int    InpEMA200Period     = 200;     // M15 EMA 200 (major trend)
+input int    InpEMA60Period      = 60;      // M15 EMA 60  (medium trend)
+input int    InpEMA30Period      = 30;      // M15 EMA 30  (fast trend)
 
-//--- M1 MACD Settings
-input group "=== M1 MACD ==="
-input int      InpMACDFast         = 12;      // MACD fast EMA period
-input int      InpMACDSlow         = 26;      // MACD slow EMA period
-input int      InpMACDSignal       = 9;       // MACD signal period
+//--- ENGINE 1: M1 Micro-Burst Spear (Scalper)
+input group "=== ENGINE 1: M1 BOLLINGER BANDS ==="
+input int    InpFastBBPeriod     = 20;      // Fast BB period (entry timing)
+input double InpFastBBDeviation  = 2.0;     // Fast BB std deviation
+input int    InpSlowBBPeriod     = 100;     // Slow BB period (volatility context)
+input double InpSlowBBDeviation  = 2.0;     // Slow BB std deviation
 
-//--- Trailing Exit Matrix
-input group "=== DYNAMIC TRAILING EXIT MATRIX ==="
-input double   InpBreakevenPips    = 150.0;   // Pips profit to trigger breakeven move
-input double   InpBreakevenBuffer  = 15.0;    // Pips buffer above entry at breakeven
-input double   InpTrailStepPips    = 50.0;    // Trailing step size in pips
-input double   InpMaxSLPips        = 240.0;   // Hard cap on maximum initial stop loss (pips)
+input group "=== ENGINE 1: M1 MACD ==="
+input int    InpMACDFast         = 12;      // MACD fast EMA
+input int    InpMACDSlow         = 26;      // MACD slow EMA
+input int    InpMACDSignal       = 9;       // MACD signal line
 
-//--- News Integration
+//--- ENGINE 1: Trailing Parameters (Scalper)
+input group "=== ENGINE 1: SCALPER EXIT MATRIX ==="
+input double InpBreakevenPips    = 120.0;   // Pips profit to trigger breakeven (lowered from 150)
+input double InpBreakevenBuffer  = 15.0;    // Buffer above entry at breakeven (pips)
+input double InpTrailStepPips    = 40.0;    // Trailing step size (pips)
+input double InpMaxSLPips        = 200.0;   // Hard cap on scalper stop loss (pips)
+
+//--- ENGINE 2: H1 Swing Trader
+input group "=== ENGINE 2: H1 SWING TRADER ==="
+input bool   InpEnableSwing      = true;    // Enable H1 swing engine
+input int    InpH1_EMA21         = 21;      // H1 fast EMA (trend pulse)
+input int    InpH1_EMA50         = 50;      // H1 medium EMA (trend spine)
+input int    InpH1_EMA200        = 200;     // H1 slow EMA (macro structure)
+input int    InpH1_RSIPeriod     = 14;      // H1 RSI period
+input double InpH1_RSIOverbought = 60.0;    // RSI level considered overbought zone exit
+input double InpH1_RSIOversold   = 40.0;    // RSI level considered oversold zone exit
+input int    InpH1_MACDFast      = 12;      // H1 MACD fast
+input int    InpH1_MACDSlow      = 26;      // H1 MACD slow
+input int    InpH1_MACDSig       = 9;       // H1 MACD signal
+input int    InpH1_ATRPeriod     = 14;      // H1 ATR period for dynamic SL/TP
+input double InpH1_SL_ATR_Multi  = 1.5;     // SL = entry ± (ATR × this multiplier)
+input double InpH1_TP_ATR_Multi  = 3.0;     // TP = entry ± (ATR × this multiplier)  [1:2 R:R]
+input double InpSwingBreakeven   = 200.0;   // Pips profit to trigger swing breakeven
+input double InpSwingTrailStep   = 80.0;    // Swing trailing step (pips)
+
+//--- NEWS Integration
 input group "=== NEWS & ECONOMIC CALENDAR ==="
-input bool     InpEnableNewsFilter = true;    // Enable news blackout filter
-input int      InpNewsPreMinutes   = 15;      // Minutes to pause BEFORE news
-input int      InpNewsPostMinutes  = 15;      // Minutes to resume AFTER news
-input int      InpStraddleMinutes  = 2;       // Minutes before news for straddle placement
-input int      InpStraddleExpiry   = 5;       // Minutes after news to cancel untriggered straddle
-input double   InpStraddlePips     = 150.0;   // Straddle distance from current price in pips
+input bool   InpEnableNewsFilter  = true;   // Enable high-impact USD news blackout
+input int    InpNewsPreMinutes    = 15;     // Minutes to pause BEFORE news
+input int    InpNewsPostMinutes   = 15;     // Minutes to resume AFTER news
+input int    InpStraddleMinutes   = 2;      // Minutes before event to place straddle
+input int    InpStraddleExpiry    = 5;      // Minutes after event to cancel untriggered leg
+input double InpStraddlePips      = 150.0;  // Straddle distance from mid-price (pips)
 
-//--- Trade Identification
+//--- EA Identity
 input group "=== EA IDENTITY ==="
-input int      InpMagicNumber      = 202401;  // Unique Magic Number
+input int    InpScalperMagic     = 202401;  // Magic number for scalper trades
+input int    InpSwingMagic       = 202402;  // Magic number for swing trades
 
 //+------------------------------------------------------------------+
-//|  GLOBAL VARIABLES & HANDLES                                        |
+//|  GLOBAL VARIABLES & HANDLES                                       |
 //+------------------------------------------------------------------+
 
-//--- Trade execution objects
-CTrade         trade;
-CPositionInfo  posInfo;
-COrderInfo     orderInfo;
+CTrade        trade;
+CPositionInfo posInfo;
+COrderInfo    orderInfo;
 
-//--- M15 EMA Indicator Handles
-int handleEMA200_M15 = INVALID_HANDLE;
-int handleEMA60_M15  = INVALID_HANDLE;
-int handleEMA30_M15  = INVALID_HANDLE;
+//--- ENGINE 1: M15 EMA handles
+int handleEMA200_M15  = INVALID_HANDLE;
+int handleEMA60_M15   = INVALID_HANDLE;
+int handleEMA30_M15   = INVALID_HANDLE;
 
-//--- M1 Bollinger Band Handles
-int handleFastBB_M1  = INVALID_HANDLE;
-int handleSlowBB_M1  = INVALID_HANDLE;
+//--- ENGINE 1: M1 BB + MACD handles
+int handleFastBB_M1   = INVALID_HANDLE;
+int handleSlowBB_M1   = INVALID_HANDLE;
+int handleMACD_M1     = INVALID_HANDLE;
 
-//--- M1 MACD Handle
-int handleMACD_M1    = INVALID_HANDLE;
+//--- ENGINE 2: H1 handles
+int handleH1_EMA21    = INVALID_HANDLE;
+int handleH1_EMA50    = INVALID_HANDLE;
+int handleH1_EMA200   = INVALID_HANDLE;
+int handleH1_RSI      = INVALID_HANDLE;
+int handleH1_MACD     = INVALID_HANDLE;
+int handleH1_ATR      = INVALID_HANDLE;
 
 //--- EA State Flags
-bool g_TradingLocked      = false;   // Set true by Harvest-Halt or Hard Floor trigger
-bool g_EmergencyShutdown  = false;   // Set true by Hard Floor — permanent halt
-bool g_HarvestLevel1Hit   = false;   // Prevents re-triggering Harvest Step 1
-bool g_HarvestLevel2Hit   = false;   // Prevents re-triggering Harvest Step 2
-bool g_HarvestLevel3Hit   = false;   // Prevents re-triggering Harvest Step 3
+bool g_EmergencyShutdown   = false;  // Hard floor breached — permanent halt
+bool g_TradingLocked        = false;  // Harvest-halt triggered — new entries blocked
+bool g_HarvestLevel1Hit     = false;
+bool g_HarvestLevel2Hit     = false;
+bool g_HarvestLevel3Hit     = false;
 
 //--- News & Straddle State
-datetime g_LastNewsEventTime    = 0; // Timestamp of the nearest upcoming/recent news event
-bool     g_StraddlePlaced       = false; // True if straddle pending orders are live
-ulong    g_StraddleBuyTicket    = 0;    // Ticket for straddle BUY STOP order
-ulong    g_StraddleSellTicket   = 0;    // Ticket for straddle SELL STOP order
-datetime g_StraddlePlacedAt     = 0;    // When straddle was placed (for expiry logic)
-datetime g_NewsEventTimestamp   = 0;    // Exact timestamp of upcoming high-impact event
+datetime g_NewsEventTimestamp  = 0;
+bool     g_StraddlePlaced       = false;
+ulong    g_StraddleBuyTicket    = 0;
+ulong    g_StraddleSellTicket   = 0;
+datetime g_StraddlePlacedAt     = 0;
 
-//--- Point & Pip conversion factor
-//    XAUUSDm on Exness: 5-digit pricing → 1 pip = 10 points
-double g_PointSize  = 0.0;  // Populated in OnInit()
-double g_PipSize    = 0.0;  // = 10 * _Point (1 pip in price)
+//--- Point/pip conversion (Exness 5-digit: 1 pip = 10 points)
+double g_PointSize  = 0.0;
+double g_PipSize    = 0.0;
+int    g_MinStopsLevel = 0;
 
-//--- Minimum stops level (dynamic, from broker)
-int    g_MinStopsLevel = 0; // Populated in OnInit() from SYMBOL_TRADE_STOPS_LEVEL
+//--- Swing trade cooldown (prevent re-entry within same H1 bar)
+datetime g_LastSwingBarTime = 0;
 
 //+------------------------------------------------------------------+
-//|  INITIALIZATION                                                    |
+//|  INITIALIZATION                                                   |
 //+------------------------------------------------------------------+
 int OnInit()
   {
-//--- Set EA identity on trade object
-   trade.SetExpertMagicNumber(InpMagicNumber);
+//--- Set trade objects
+   trade.SetExpertMagicNumber(InpScalperMagic); // Default to scalper magic
    trade.SetDeviationInPoints(InpMaxSlippage);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);      // Exness requires IOC
 
-//--- CRITICAL: Set Exness IOC filling mode (avoids "invalid fill" rejections)
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
-
-//--- Cache point/pip sizes
-   g_PointSize = _Point;
-   g_PipSize   = 10.0 * _Point;  // 1 pip = 10 points on a 5-digit broker
-
-//--- Read broker's minimum stops distance (dynamic — changes with volatility)
+//--- Cache pip metrics
+   g_PointSize    = _Point;
+   g_PipSize      = 10.0 * _Point;  // 5-digit broker: 1 pip = 10 points
    g_MinStopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   PrintFormat("[INIT] MinStopsLevel = %d points | PipSize = %.5f", g_MinStopsLevel, g_PipSize);
+   PrintFormat("[INIT] MinStopsLevel=%d pts | PipSize=%.5f", g_MinStopsLevel, g_PipSize);
 
-//--- ── M15 EMA Handles ──────────────────────────────────────────────
+//--- ENGINE 1: M15 EMA handles
    handleEMA200_M15 = iMA(_Symbol, PERIOD_M15, InpEMA200Period, 0, MODE_EMA, PRICE_CLOSE);
    handleEMA60_M15  = iMA(_Symbol, PERIOD_M15, InpEMA60Period,  0, MODE_EMA, PRICE_CLOSE);
    handleEMA30_M15  = iMA(_Symbol, PERIOD_M15, InpEMA30Period,  0, MODE_EMA, PRICE_CLOSE);
-
    if(handleEMA200_M15 == INVALID_HANDLE ||
       handleEMA60_M15  == INVALID_HANDLE ||
       handleEMA30_M15  == INVALID_HANDLE)
-     {
-      Print("[INIT ERROR] Failed to create M15 EMA handles. EA aborted.");
-      return INIT_FAILED;
-     }
+     { Print("[INIT ERROR] M15 EMA handles failed."); return INIT_FAILED; }
 
-//--- ── M1 Bollinger Band Handles ───────────────────────────────────
+//--- ENGINE 1: M1 BB handles
    handleFastBB_M1 = iBands(_Symbol, PERIOD_M1, InpFastBBPeriod, 0, InpFastBBDeviation, PRICE_CLOSE);
    handleSlowBB_M1 = iBands(_Symbol, PERIOD_M1, InpSlowBBPeriod, 0, InpSlowBBDeviation, PRICE_CLOSE);
-
    if(handleFastBB_M1 == INVALID_HANDLE || handleSlowBB_M1 == INVALID_HANDLE)
-     {
-      Print("[INIT ERROR] Failed to create M1 Bollinger Band handles. EA aborted.");
-      return INIT_FAILED;
-     }
+     { Print("[INIT ERROR] M1 Bollinger Band handles failed."); return INIT_FAILED; }
 
-//--- ── M1 MACD Handle ──────────────────────────────────────────────
+//--- ENGINE 1: M1 MACD handle
    handleMACD_M1 = iMACD(_Symbol, PERIOD_M1, InpMACDFast, InpMACDSlow, InpMACDSignal, PRICE_CLOSE);
-
    if(handleMACD_M1 == INVALID_HANDLE)
+     { Print("[INIT ERROR] M1 MACD handle failed."); return INIT_FAILED; }
+
+//--- ENGINE 2: H1 handles (only if swing enabled)
+   if(InpEnableSwing)
      {
-      Print("[INIT ERROR] Failed to create M1 MACD handle. EA aborted.");
-      return INIT_FAILED;
+      handleH1_EMA21  = iMA  (_Symbol, PERIOD_H1, InpH1_EMA21,   0, MODE_EMA,  PRICE_CLOSE);
+      handleH1_EMA50  = iMA  (_Symbol, PERIOD_H1, InpH1_EMA50,   0, MODE_EMA,  PRICE_CLOSE);
+      handleH1_EMA200 = iMA  (_Symbol, PERIOD_H1, InpH1_EMA200,  0, MODE_EMA,  PRICE_CLOSE);
+      handleH1_RSI    = iRSI (_Symbol, PERIOD_H1, InpH1_RSIPeriod, PRICE_CLOSE);
+      handleH1_MACD   = iMACD(_Symbol, PERIOD_H1, InpH1_MACDFast, InpH1_MACDSlow, InpH1_MACDSig, PRICE_CLOSE);
+      handleH1_ATR    = iATR (_Symbol, PERIOD_H1, InpH1_ATRPeriod);
+
+      if(handleH1_EMA21  == INVALID_HANDLE || handleH1_EMA50  == INVALID_HANDLE ||
+         handleH1_EMA200 == INVALID_HANDLE || handleH1_RSI    == INVALID_HANDLE ||
+         handleH1_MACD   == INVALID_HANDLE || handleH1_ATR    == INVALID_HANDLE)
+        { Print("[INIT ERROR] H1 Swing handles failed."); return INIT_FAILED; }
      }
 
-   Print("[INIT] XAUUSDm Precision Scalper initialized successfully.");
-   Print("[INIT] Hard Floor: $", InpHardFloorEquity, " | Lot Size: ", InpLotSize);
+   Print("[INIT] ForgeScalper v2.0 initialized. Dual-engine ready.");
+   Print("[INIT] Hard Floor: $", InpHardFloorEquity,
+         " | Scalper Risk: ", InpScalperRiskPct, "%",
+         " | Swing: ", (InpEnableSwing ? "ON" : "OFF"));
    return INIT_SUCCEEDED;
   }
 
 //+------------------------------------------------------------------+
-//|  DEINITIALIZATION                                                  |
+//|  DEINITIALIZATION                                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-//--- Release all indicator handles to free memory
    if(handleEMA200_M15 != INVALID_HANDLE) IndicatorRelease(handleEMA200_M15);
    if(handleEMA60_M15  != INVALID_HANDLE) IndicatorRelease(handleEMA60_M15);
    if(handleEMA30_M15  != INVALID_HANDLE) IndicatorRelease(handleEMA30_M15);
    if(handleFastBB_M1  != INVALID_HANDLE) IndicatorRelease(handleFastBB_M1);
    if(handleSlowBB_M1  != INVALID_HANDLE) IndicatorRelease(handleSlowBB_M1);
    if(handleMACD_M1    != INVALID_HANDLE) IndicatorRelease(handleMACD_M1);
-   PrintFormat("[DEINIT] EA removed. Reason code: %d", reason);
+   if(handleH1_EMA21   != INVALID_HANDLE) IndicatorRelease(handleH1_EMA21);
+   if(handleH1_EMA50   != INVALID_HANDLE) IndicatorRelease(handleH1_EMA50);
+   if(handleH1_EMA200  != INVALID_HANDLE) IndicatorRelease(handleH1_EMA200);
+   if(handleH1_RSI     != INVALID_HANDLE) IndicatorRelease(handleH1_RSI);
+   if(handleH1_MACD    != INVALID_HANDLE) IndicatorRelease(handleH1_MACD);
+   if(handleH1_ATR     != INVALID_HANDLE) IndicatorRelease(handleH1_ATR);
+   PrintFormat("[DEINIT] ForgeScalper v2.0 removed. Code=%d", reason);
   }
 
 //+------------------------------------------------------------------+
-//|  MAIN TICK HANDLER                                                 |
+//|  MAIN TICK HANDLER                                                |
 //+------------------------------------------------------------------+
 void OnTick()
   {
+//--- Permanent shutdown guard
    if(g_EmergencyShutdown)
      {
-      Comment("EMERGENCY SHUTDOWN ACTIVE. Hard floor breached; restart manually.");
+      Comment("⛔ EMERGENCY SHUTDOWN — Hard floor breached. Restart EA manually.");
       return;
      }
 
-   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   long   currentSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   long   spread  = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
 
-   //--- Absolute hard floor: close all exposure and permanently halt this session.
-   if(currentEquity <= InpHardFloorEquity)
+//--- Hard floor: flatten everything, halt permanently
+   if(equity <= InpHardFloorEquity)
      {
-      PrintFormat("[HARD FLOOR] Equity %.2f <= Floor %.2f. Emergency flatten + halt.",
-                  currentEquity, InpHardFloorEquity);
-      SendNotification(StringFormat("HARD FLOOR HIT: Equity $%.2f. Positions closed, EA halted.", currentEquity));
+      PrintFormat("[HARD FLOOR] Equity $%.2f ≤ Floor $%.2f — Emergency close + halt.",
+                  equity, InpHardFloorEquity);
+      SendNotification(StringFormat("⛔ HARD FLOOR HIT: Equity $%.2f. Positions closed.", equity));
       CloseAllPositions();
       CancelAllPendingOrders();
       g_EmergencyShutdown = true;
       g_TradingLocked     = true;
-      Comment("EMERGENCY SHUTDOWN: Hard floor breached.");
       return;
      }
 
-   //--- Fractional harvest ladder: lock new entries at each milestone.
-   CheckHarvestTargets(currentEquity);
+//--- Check harvest milestones (locks new entries, sends push notification)
+   CheckHarvestTargets(equity);
 
-   //--- Always manage open trades even if entries are blocked.
-   ManagePosition();
+//--- ═══════════════════════════════════════════════════════════════
+//    POSITION MANAGEMENT ALWAYS RUNS — even when entries are locked.
+//    This ensures open trades are actively managed regardless of state.
+//--- ═══════════════════════════════════════════════════════════════
+   ManageOpenPositions(); // Unified manager handles both scalper + swing
 
+//--- If entry is locked by harvest, skip new entry logic
    if(g_TradingLocked)
      {
-      Comment(StringFormat("TRADING LOCKED (Harvest). Equity: $%.2f", currentEquity));
-      UpdateChartComment(currentEquity, currentSpread);
+      UpdateChartComment(equity, spread);
       return;
      }
 
-   if(currentSpread > InpMaxSpreadPoints)
+//--- Spread guard (only blocks scalper-style entries; swing can absorb wider spreads)
+   bool spreadOK = (spread <= InpMaxSpreadPoints);
+
+//--- News filter: blocks entries and manages straddle lifecycle
+   bool newsBlackout   = false;
+   bool straddleWindow = false;
+   if(InpEnableNewsFilter)
+      CheckNewsCalendar(newsBlackout, straddleWindow);
+
+//--- Manage straddle expiry regardless of new entry logic
+   if(g_StraddlePlaced)
+      ManageStraddleExpiry();
+
+//--- ── ENGINE 1: M1 SCALPER ────────────────────────────────────────
+//    Fires when: spread OK + no news + in session + no open scalp trade
+   if(spreadOK && !newsBlackout && IsInSession() && CountPositionsByMagic(InpScalperMagic) == 0
+      && !g_StraddlePlaced)
      {
-      Comment(StringFormat("SPREAD TOO HIGH: %d pts (max %d)", currentSpread, InpMaxSpreadPoints));
-      UpdateChartComment(currentEquity, currentSpread);
-      return;
+      int scalperSignal = CheckScalperEntry(); // +1 buy, -1 sell, 0 no trade
+      if(scalperSignal == 1)
+         ExecuteScalperBuy();
+      else if(scalperSignal == -1)
+         ExecuteScalperSell();
      }
 
-   //--- Pause entries around high-impact USD news and manage pre-news straddle.
-   if(IsNewsEvent())
+//--- ── ENGINE 2: H1 SWING TRADER ──────────────────────────────────
+//    Fires when: swing enabled + no news + max 1 swing trade open
+//    Uses InpSwingAnySession to optionally allow outside-session entries
+   if(InpEnableSwing && !newsBlackout && CountPositionsByMagic(InpSwingMagic) == 0)
      {
-      Comment(StringFormat("NEWS BLACKOUT ACTIVE | Equity: $%.2f | Spread: %d pts",
-                           currentEquity, currentSpread));
-      UpdateChartComment(currentEquity, currentSpread);
-      return;
+      bool sessionOK = (!InpEnableSession || InpSwingAnySession || IsInSession());
+      if(sessionOK)
+        {
+         // Throttle: only check once per new H1 bar to reduce signal noise
+         datetime currentH1Bar = iTime(_Symbol, PERIOD_H1, 0);
+         if(currentH1Bar != g_LastSwingBarTime)
+           {
+            int swingSignal = CheckSwingEntry(); // +1 buy, -1 sell, 0 no trade
+            if(swingSignal == 1)
+              { ExecuteSwingBuy();  g_LastSwingBarTime = currentH1Bar; }
+            else if(swingSignal == -1)
+              { ExecuteSwingSell(); g_LastSwingBarTime = currentH1Bar; }
+            else
+               g_LastSwingBarTime = currentH1Bar; // Still advance bar to avoid repeat checks
+           }
+        }
      }
 
-   //--- Entry logic only when fully flat and no pending straddle basket.
-   if(CountOpenPositions() == 0 && !g_StraddlePlaced)
-     {
-      int entrySignal = CheckForEntry(); // +1 buy, -1 sell, 0 no trade
-      if(entrySignal == 1)
-         ExecuteBuy();
-      else if(entrySignal == -1)
-         ExecuteSell();
-     }
+//--- Place pre-news straddle if in straddle window and flat
+   if(straddleWindow && !g_StraddlePlaced && CountPositionsByMagic(InpScalperMagic) == 0)
+      PlaceNetlessStraddle(g_NewsEventTimestamp);
 
-   UpdateChartComment(currentEquity, currentSpread);
+   UpdateChartComment(equity, spread);
   }
 
 //+------------------------------------------------------------------+
-//|  MISSING EXECUTION LOGIC: CHECKFORENTRY                           |
-//|  Returns +1 Buy, -1 Sell, 0 No Signal                             |
+//|  ══════════════════════════════════════════════════════════════   |
+//|  ENGINE 1: SCALPER SIGNAL LOGIC                                  |
+//|  Multi-timeframe: M15 bias gate + M1 BB squeeze + MACD cross     |
+//|  Returns: +1=Buy, -1=Sell, 0=NoTrade                             |
+//|  ══════════════════════════════════════════════════════════════   |
 //+------------------------------------------------------------------+
-int CheckForEntry()
+int CheckScalperEntry()
   {
-//--- Macro-trend shield (M15): dynamic arrays only
-   double ema200[];
-   double ema60[];
-   double ema30[];
-   double m15Close[];
-
+//── LAYER 1: M15 MACRO-TREND BIAS ────────────────────────────────
+//   All three of: Price > EMA200, EMA30 > EMA60 = bullish
+//   All three of: Price < EMA200, EMA30 < EMA60 = bearish
+   double ema200[], ema60[], ema30[], m15Close[];
    ArraySetAsSeries(ema200,   true);
    ArraySetAsSeries(ema60,    true);
    ArraySetAsSeries(ema30,    true);
@@ -288,27 +390,24 @@ int CheckForEntry()
    if(CopyClose(_Symbol, PERIOD_M15, 1, 1, m15Close) < 1) return 0;
 
    int macroBias = 0;
-   if(m15Close[0] > ema200[1] && ema30[1] > ema60[1])
-      macroBias = 1;
-   else if(m15Close[0] < ema200[1] && ema30[1] < ema60[1])
-      macroBias = -1;
-   else
-      return 0;
+   // Use confirmed closed bar (index 1) to avoid repainting
+   if(m15Close[0] > ema200[1] && ema30[1] > ema60[1])  macroBias =  1;
+   else if(m15Close[0] < ema200[1] && ema30[1] < ema60[1]) macroBias = -1;
+   else return 0; // Neutral — no trade
 
-//--- Micro-burst spear (M1): FastBB vs SlowBB + MACD cross in regime
-   double fastUpper[];
-   double fastLower[];
-   double slowUpper[];
-   double slowLower[];
-   double macdMain[];
-   double macdSignal[];
+//── LAYER 2: M1 MICRO-BURST SPEAR ────────────────────────────────
+//   BB Compression: Fast BB band crosses through Slow BB band
+//   MACD Cross: Signal-line cross in direction of macro bias
+//   NOTE (FIX 1): Zero-zone filter REMOVED — the old requirement for
+//   MACD to be below/above zero simultaneously with M15 uptrend/downtrend
+//   was contradictory. Now only the crossover direction matters.
+   double fastUpper[], fastLower[];
+   double slowUpper[], slowLower[];
+   double macdMain[], macdSignal[];
 
-   ArraySetAsSeries(fastUpper,  true);
-   ArraySetAsSeries(fastLower,  true);
-   ArraySetAsSeries(slowUpper,  true);
-   ArraySetAsSeries(slowLower,  true);
-   ArraySetAsSeries(macdMain,   true);
-   ArraySetAsSeries(macdSignal, true);
+   ArraySetAsSeries(fastUpper,  true); ArraySetAsSeries(fastLower,  true);
+   ArraySetAsSeries(slowUpper,  true); ArraySetAsSeries(slowLower,  true);
+   ArraySetAsSeries(macdMain,   true); ArraySetAsSeries(macdSignal, true);
 
    if(CopyBuffer(handleFastBB_M1, 1, 0, 3, fastUpper)  < 3) return 0;
    if(CopyBuffer(handleFastBB_M1, 2, 0, 3, fastLower)  < 3) return 0;
@@ -317,1022 +416,716 @@ int CheckForEntry()
    if(CopyBuffer(handleMACD_M1,   0, 0, 3, macdMain)   < 3) return 0;
    if(CopyBuffer(handleMACD_M1,   1, 0, 3, macdSignal) < 3) return 0;
 
-   bool fastBelowSlow = (fastLower[1] < slowLower[1]) && (fastLower[2] >= slowLower[2]);
-   bool fastAboveSlow = (fastUpper[1] > slowUpper[1]) && (fastUpper[2] <= slowUpper[2]);
+   // BUY conditions:
+   // A) Fast BB lower band crosses BELOW slow BB lower (compression squeeze in down direction)
+   // B) MACD line crosses ABOVE signal line (bullish momentum cross) — any zone
+   bool bbBuySetup  = (fastLower[1] < slowLower[1]) && (fastLower[2] >= slowLower[2]);
+   bool macdBullish = (macdMain[1] > macdSignal[1]) && (macdMain[2] <= macdSignal[2]);
 
-   bool macdBullCrossOversold = (macdMain[1] > macdSignal[1]) &&
-                                (macdMain[2] <= macdSignal[2]) &&
-                                (macdMain[1] < 0.0) &&
-                                (macdSignal[1] < 0.0);
+   // SELL conditions:
+   // A) Fast BB upper band crosses ABOVE slow BB upper (expansion squeeze to upside = exhaustion)
+   // B) MACD line crosses BELOW signal line (bearish momentum cross) — any zone
+   bool bbSellSetup  = (fastUpper[1] > slowUpper[1]) && (fastUpper[2] <= slowUpper[2]);
+   bool macdBearish  = (macdMain[1] < macdSignal[1]) && (macdMain[2] >= macdSignal[2]);
 
-   bool macdBearCrossOverbought = (macdMain[1] < macdSignal[1]) &&
-                                  (macdMain[2] >= macdSignal[2]) &&
-                                  (macdMain[1] > 0.0) &&
-                                  (macdSignal[1] > 0.0);
-
-   if(macroBias == 1 && fastBelowSlow && macdBullCrossOversold)
-      return 1;
-
-   if(macroBias == -1 && fastAboveSlow && macdBearCrossOverbought)
-      return -1;
+   if(macroBias == 1  && bbBuySetup  && macdBullish) return  1;
+   if(macroBias == -1 && bbSellSetup && macdBearish)  return -1;
 
    return 0;
   }
 
 //+------------------------------------------------------------------+
-//|  ORDERSEND HELPER: MODIFY POSITION SL/TP                          |
+//|  ENGINE 1: EXECUTE SCALPER BUY                                   |
+//|  SL at Fast BB lower band (capped at InpMaxSLPips)               |
+//|  TP is 0 — managed by trailing exit matrix                       |
 //+------------------------------------------------------------------+
-bool ModifyPositionSLByOrderSend(ulong ticket, double newSL, double currentTP)
-  {
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   req.action   = TRADE_ACTION_SLTP;
-   req.symbol   = _Symbol;
-   req.magic    = InpMagicNumber;
-   req.position = ticket;
-   req.sl       = NormalizeDouble(newSL, _Digits);
-   req.tp       = currentTP;
-
-   if(!OrderSend(req, res))
-     {
-      PrintFormat("[SL MODIFY ERROR] Ticket %I64u send failed. LastError=%d", ticket, GetLastError());
-      return false;
-     }
-
-   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
-     {
-      PrintFormat("[SL MODIFY ERROR] Ticket %I64u retcode=%d | %s",
-                  ticket, res.retcode, res.comment);
-      return false;
-     }
-
-   return true;
-  }
-
-//+------------------------------------------------------------------+
-//|  ORDERSEND HELPER: CLOSE POSITION BY MARKET DEAL                  |
-//+------------------------------------------------------------------+
-bool ClosePositionByOrderSend(ulong ticket, ENUM_POSITION_TYPE posType, double volume)
-  {
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   req.action       = TRADE_ACTION_DEAL;
-   req.symbol       = _Symbol;
-   req.magic        = InpMagicNumber;
-   req.position     = ticket;
-   req.volume       = volume;
-   req.deviation    = InpMaxSlippage;
-   req.type_filling = ORDER_FILLING_IOC;
-
-   if(posType == POSITION_TYPE_BUY)
-     {
-      req.type  = ORDER_TYPE_SELL;
-      req.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-     }
-   else
-     {
-      req.type  = ORDER_TYPE_BUY;
-      req.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-     }
-
-   if(!OrderSend(req, res))
-     {
-      PrintFormat("[CLOSE ERROR] Ticket %I64u send failed. LastError=%d", ticket, GetLastError());
-      return false;
-     }
-
-   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
-     {
-      PrintFormat("[CLOSE ERROR] Ticket %I64u retcode=%d | %s",
-                  ticket, res.retcode, res.comment);
-      return false;
-     }
-
-   return true;
-  }
-
-//+------------------------------------------------------------------+
-//|  ORDERSEND HELPER: CANCEL PENDING ORDER                           |
-//+------------------------------------------------------------------+
-bool CancelPendingByTicket(ulong orderTicket)
-  {
-   if(orderTicket == 0)
-      return false;
-
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   req.action = TRADE_ACTION_REMOVE;
-   req.order  = orderTicket;
-   req.symbol = _Symbol;
-   req.magic  = InpMagicNumber;
-
-   if(!OrderSend(req, res))
-      return false;
-
-   return (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED);
-  }
-
-//+------------------------------------------------------------------+
-//|  NEWS STRADDLE: NETLESS TWO-LEG PLACEMENT                         |
-//+------------------------------------------------------------------+
-void PlaceNetlessStraddle(datetime eventTime)
+void ExecuteScalperBuy()
   {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(ask <= 0.0 || bid <= 0.0)
-      return;
+   if(ask <= 0.0) return;
 
-   double midPrice     = (ask + bid) / 2.0;
-   double straddleDist = InpStraddlePips * g_PipSize;
+//--- Get Fast BB lower band for SL placement
+   double fastLower[];
+   ArraySetAsSeries(fastLower, true);
+   if(CopyBuffer(handleFastBB_M1, 2, 0, 2, fastLower) < 2) return;
 
-   double buyStopPrice  = NormalizeDouble(midPrice + straddleDist, _Digits);
-   double sellStopPrice = NormalizeDouble(midPrice - straddleDist, _Digits);
+   double rawSL      = fastLower[1];                         // Lower BB of last closed M1 bar
+   double maxSLPrice = ask - (InpMaxSLPips * g_PipSize);     // Maximum SL distance cap
+   double sl         = MathMax(rawSL, maxSLPrice);            // Use whichever is tighter (closer)
 
-   double minDist = (g_MinStopsLevel + 10) * g_PointSize;
-   if((buyStopPrice - ask) < minDist)
-      buyStopPrice = NormalizeDouble(ask + minDist, _Digits);
-   if((bid - sellStopPrice) < minDist)
-      sellStopPrice = NormalizeDouble(bid - minDist, _Digits);
+//--- Enforce broker minimum stops distance
+   double minDist = (g_MinStopsLevel + 5) * g_PointSize;
+   if((ask - sl) < minDist) sl = ask - minDist;
+   sl = NormalizeDouble(sl, _Digits);
 
-   datetime expiry = eventTime + InpStraddleExpiry * 60;
-   double lot      = CalculateLotSize();
+   if(sl >= ask) { PrintFormat("[SCALPER BUY] Invalid SL %.5f >= ASK %.5f. Skip.", sl, ask); return; }
 
-   MqlTradeRequest reqBuy;
-   MqlTradeRequest reqSell;
-   MqlTradeResult  resBuy;
-   MqlTradeResult  resSell;
-   ZeroMemory(reqBuy);
-   ZeroMemory(reqSell);
-   ZeroMemory(resBuy);
-   ZeroMemory(resSell);
+//--- Calculate dynamic lot from risk %
+   double lot = CalcLotFromRisk(ask - sl, InpScalperRiskPct);
 
-   reqBuy.action       = TRADE_ACTION_PENDING;
-   reqBuy.symbol       = _Symbol;
-   reqBuy.magic        = InpMagicNumber;
-   reqBuy.volume       = lot;
-   reqBuy.type         = ORDER_TYPE_BUY_STOP;
-   reqBuy.price        = buyStopPrice;
-   reqBuy.sl           = NormalizeDouble(buyStopPrice - InpMaxSLPips * g_PipSize, _Digits);
-   reqBuy.tp           = 0.0;
-   reqBuy.deviation    = InpMaxSlippage;
-   reqBuy.type_filling = ORDER_FILLING_RETURN;
-   reqBuy.type_time    = ORDER_TIME_SPECIFIED;
-   reqBuy.expiration   = expiry;
-   reqBuy.comment      = "NewsStraddleBuy";
-
-   reqSell.action       = TRADE_ACTION_PENDING;
-   reqSell.symbol       = _Symbol;
-   reqSell.magic        = InpMagicNumber;
-   reqSell.volume       = lot;
-   reqSell.type         = ORDER_TYPE_SELL_STOP;
-   reqSell.price        = sellStopPrice;
-   reqSell.sl           = NormalizeDouble(sellStopPrice + InpMaxSLPips * g_PipSize, _Digits);
-   reqSell.tp           = 0.0;
-   reqSell.deviation    = InpMaxSlippage;
-   reqSell.type_filling = ORDER_FILLING_RETURN;
-   reqSell.type_time    = ORDER_TIME_SPECIFIED;
-   reqSell.expiration   = expiry;
-   reqSell.comment      = "NewsStraddleSell";
-
-   bool buyPlaced  = OrderSend(reqBuy,  resBuy)  &&
-                     (resBuy.retcode == TRADE_RETCODE_DONE || resBuy.retcode == TRADE_RETCODE_PLACED);
-   bool sellPlaced = OrderSend(reqSell, resSell) &&
-                     (resSell.retcode == TRADE_RETCODE_DONE || resSell.retcode == TRADE_RETCODE_PLACED);
-
-   ulong buyTicket  = buyPlaced  ? resBuy.order  : 0;
-   ulong sellTicket = sellPlaced ? resSell.order : 0;
-
-//--- Netless requirement: if both legs are not live, cancel any partial leg immediately.
-   if(!(buyPlaced && sellPlaced))
-     {
-      if(buyTicket  > 0) CancelPendingByTicket(buyTicket);
-      if(sellTicket > 0) CancelPendingByTicket(sellTicket);
-
-      g_StraddleBuyTicket  = 0;
-      g_StraddleSellTicket = 0;
-      g_StraddlePlaced     = false;
-
-      PrintFormat("[STRADDLE ERROR] Netless rule rollback. Buy ret=%d | Sell ret=%d",
-                  resBuy.retcode, resSell.retcode);
-      return;
-     }
-
-   g_StraddleBuyTicket   = buyTicket;
-   g_StraddleSellTicket  = sellTicket;
-   g_StraddlePlaced      = true;
-   g_StraddlePlacedAt    = TimeCurrent();
-   g_NewsEventTimestamp  = eventTime;
-
-   PrintFormat("[STRADDLE] Netless pair placed. Buy=%I64u | Sell=%I64u | Event=%s",
-               g_StraddleBuyTicket, g_StraddleSellTicket, TimeToString(eventTime));
+//--- Execute — no TP (trailing exit manages the trade)
+   trade.SetExpertMagicNumber(InpScalperMagic);
+   bool result = trade.Buy(lot, _Symbol, ask, sl, 0.0,
+                           StringFormat("ForgeScalp-BUY|SL%.1f", (ask - sl) / g_PipSize));
+   if(result)
+      PrintFormat("[SCALPER BUY] Lot=%.2f | Ask=%.5f | SL=%.5f | Risk=%.2f pips | Ticket=%I64u",
+                  lot, ask, sl, (ask - sl) / g_PipSize, trade.ResultOrder());
+   else
+      PrintFormat("[SCALPER BUY ERROR] %d | %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
   }
 
 //+------------------------------------------------------------------+
-//|  MISSING EXECUTION LOGIC: MANAGEPOSITION                          |
-//|  Breakeven + step trailing + MACD adverse zero-line exit          |
+//|  ENGINE 1: EXECUTE SCALPER SELL                                  |
 //+------------------------------------------------------------------+
-void ManagePosition()
+void ExecuteScalperSell()
   {
-//--- Dynamic MACD buffers (required to avoid static-array warnings)
-   double macdMain[];
-   double macdSignal[];
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(bid <= 0.0) return;
+
+   double fastUpper[];
+   ArraySetAsSeries(fastUpper, true);
+   if(CopyBuffer(handleFastBB_M1, 1, 0, 2, fastUpper) < 2) return;
+
+   double rawSL      = fastUpper[1];
+   double maxSLPrice = bid + (InpMaxSLPips * g_PipSize);
+   double sl         = MathMin(rawSL, maxSLPrice);
+
+   double minDist = (g_MinStopsLevel + 5) * g_PointSize;
+   if((sl - bid) < minDist) sl = bid + minDist;
+   sl = NormalizeDouble(sl, _Digits);
+
+   if(sl <= bid) { PrintFormat("[SCALPER SELL] Invalid SL %.5f <= BID %.5f. Skip.", sl, bid); return; }
+
+   double lot = CalcLotFromRisk(sl - bid, InpScalperRiskPct);
+
+   trade.SetExpertMagicNumber(InpScalperMagic);
+   bool result = trade.Sell(lot, _Symbol, bid, sl, 0.0,
+                            StringFormat("ForgeScalp-SELL|SL%.1f", (sl - bid) / g_PipSize));
+   if(result)
+      PrintFormat("[SCALPER SELL] Lot=%.2f | Bid=%.5f | SL=%.5f | Risk=%.2f pips | Ticket=%I64u",
+                  lot, bid, sl, (sl - bid) / g_PipSize, trade.ResultOrder());
+   else
+      PrintFormat("[SCALPER SELL ERROR] %d | %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+  }
+
+//+------------------------------------------------------------------+
+//|  ══════════════════════════════════════════════════════════════   |
+//|  ENGINE 2: H1 SWING SIGNAL LOGIC                                 |
+//|  Strategy (from knowledge base):                                 |
+//|   - Triple EMA alignment (21/50/200) for directional bias        |
+//|   - RSI(14) pullback recovery above/below 40/60 zone             |
+//|   - MACD(12,26,9) H1 histogram turns positive/negative           |
+//|   - ATR(14) for dynamic SL and TP placement (1:2 R:R)            |
+//|  Returns: +1=Buy, -1=Sell, 0=NoTrade                             |
+//|  ══════════════════════════════════════════════════════════════   |
+//+------------------------------------------------------------------+
+int CheckSwingEntry()
+  {
+   if(!InpEnableSwing) return 0;
+   if(handleH1_EMA21 == INVALID_HANDLE) return 0;
+
+//── H1 TRIPLE EMA TREND ALIGNMENT ────────────────────────────────
+   double h1ema21[], h1ema50[], h1ema200[];
+   ArraySetAsSeries(h1ema21,  true);
+   ArraySetAsSeries(h1ema50,  true);
+   ArraySetAsSeries(h1ema200, true);
+
+   if(CopyBuffer(handleH1_EMA21,  0, 0, 3, h1ema21)  < 3) return 0;
+   if(CopyBuffer(handleH1_EMA50,  0, 0, 3, h1ema50)  < 3) return 0;
+   if(CopyBuffer(handleH1_EMA200, 0, 0, 3, h1ema200) < 3) return 0;
+
+   // Use bar[1] (last confirmed closed H1 bar) for all comparisons
+   double e21 = h1ema21[1], e50 = h1ema50[1], e200 = h1ema200[1];
+
+   // Bullish stacked alignment: EMA21 > EMA50 > EMA200
+   bool bullishStack = (e21 > e50 && e50 > e200);
+   // Bearish stacked alignment: EMA21 < EMA50 < EMA200
+   bool bearishStack = (e21 < e50 && e50 < e200);
+
+   if(!bullishStack && !bearishStack) return 0; // No clean trend structure
+
+//── H1 RSI PULLBACK RECOVERY ─────────────────────────────────────
+//   For BUY: RSI was in oversold zone (< 40) and is now recovering above it
+//   For SELL: RSI was in overbought zone (> 60) and is now dropping below it
+//   This catches pullback entries in the trend direction (not tops/bottoms)
+   double rsi[];
+   ArraySetAsSeries(rsi, true);
+   if(CopyBuffer(handleH1_RSI, 0, 0, 3, rsi) < 3) return 0;
+
+   // RSI recovery from oversold (buy in uptrend pullback)
+   bool rsiBullRecovery = (rsi[1] > InpH1_RSIOversold) && (rsi[2] <= InpH1_RSIOversold);
+   // RSI rejection from overbought (sell in downtrend pullback)
+   bool rsiBearRejection = (rsi[1] < InpH1_RSIOverbought) && (rsi[2] >= InpH1_RSIOverbought);
+
+//── H1 MACD CONFIRMATION ─────────────────────────────────────────
+//   MACD histogram crosses from negative to positive for buy (momentum aligned)
+//   MACD histogram crosses from positive to negative for sell
+   double h1macdMain[], h1macdSig[];
+   ArraySetAsSeries(h1macdMain, true);
+   ArraySetAsSeries(h1macdSig,  true);
+   if(CopyBuffer(handleH1_MACD, 0, 0, 3, h1macdMain) < 3) return 0;
+   if(CopyBuffer(handleH1_MACD, 1, 0, 3, h1macdSig)  < 3) return 0;
+
+   // Bullish cross: MACD crossed above signal line
+   bool macdBullCross = (h1macdMain[1] > h1macdSig[1]) && (h1macdMain[2] <= h1macdSig[2]);
+   // Bearish cross: MACD crossed below signal line
+   bool macdBearCross = (h1macdMain[1] < h1macdSig[1]) && (h1macdMain[2] >= h1macdSig[2]);
+
+//── COMBINE ALL CONDITIONS ────────────────────────────────────────
+   // SWING BUY: Bullish EMA stack + RSI recovering from oversold + MACD bullish cross
+   if(bullishStack && rsiBullRecovery && macdBullCross) return  1;
+
+   // SWING SELL: Bearish EMA stack + RSI rejected from overbought + MACD bearish cross
+   if(bearishStack && rsiBearRejection && macdBearCross) return -1;
+
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//|  ENGINE 2: EXECUTE SWING BUY                                     |
+//|  SL = entry - (ATR × InpH1_SL_ATR_Multi)                        |
+//|  TP = entry + (ATR × InpH1_TP_ATR_Multi)   → 1:2 R:R default    |
+//+------------------------------------------------------------------+
+void ExecuteSwingBuy()
+  {
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(ask <= 0.0) return;
+
+//--- Get ATR for dynamic SL/TP sizing
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   if(CopyBuffer(handleH1_ATR, 0, 0, 2, atr) < 2) return;
+   double atrValue = atr[1]; // Last confirmed H1 ATR
+   if(atrValue <= 0.0) return;
+
+//--- Calculate SL and TP from ATR multiples
+   double sl = NormalizeDouble(ask - atrValue * InpH1_SL_ATR_Multi, _Digits);
+   double tp = NormalizeDouble(ask + atrValue * InpH1_TP_ATR_Multi, _Digits);
+
+//--- Enforce broker minimum stops
+   double minDist = (g_MinStopsLevel + 5) * g_PointSize;
+   if((ask - sl) < minDist) sl = NormalizeDouble(ask - minDist, _Digits);
+   if((tp - ask) < minDist) tp = NormalizeDouble(ask + minDist * 2, _Digits);
+
+   if(sl >= ask) { Print("[SWING BUY] Invalid SL. Skip."); return; }
+
+//--- Dynamic lot from swing risk %
+   double lot = CalcLotFromRisk(ask - sl, InpSwingRiskPct);
+
+   double slPips = (ask - sl) / g_PipSize;
+   double tpPips = (tp - ask) / g_PipSize;
+
+   trade.SetExpertMagicNumber(InpSwingMagic);
+   bool result = trade.Buy(lot, _Symbol, ask, sl, tp,
+                           StringFormat("ForgeSwing-BUY|ATR%.1f|RR%.1f", atrValue / g_PipSize, tpPips / slPips));
+   if(result)
+      PrintFormat("[SWING BUY] Lot=%.2f | Ask=%.5f | SL=%.5f (%.1fpip) | TP=%.5f (%.1fpip) | R:R=1:%.1f | Ticket=%I64u",
+                  lot, ask, sl, slPips, tp, tpPips, tpPips / slPips, trade.ResultOrder());
+   else
+      PrintFormat("[SWING BUY ERROR] %d | %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+  }
+
+//+------------------------------------------------------------------+
+//|  ENGINE 2: EXECUTE SWING SELL                                    |
+//+------------------------------------------------------------------+
+void ExecuteSwingSell()
+  {
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(bid <= 0.0) return;
+
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   if(CopyBuffer(handleH1_ATR, 0, 0, 2, atr) < 2) return;
+   double atrValue = atr[1];
+   if(atrValue <= 0.0) return;
+
+   double sl = NormalizeDouble(bid + atrValue * InpH1_SL_ATR_Multi, _Digits);
+   double tp = NormalizeDouble(bid - atrValue * InpH1_TP_ATR_Multi, _Digits);
+
+   double minDist = (g_MinStopsLevel + 5) * g_PointSize;
+   if((sl - bid) < minDist) sl = NormalizeDouble(bid + minDist, _Digits);
+   if((bid - tp) < minDist) tp = NormalizeDouble(bid - minDist * 2, _Digits);
+
+   if(sl <= bid) { Print("[SWING SELL] Invalid SL. Skip."); return; }
+
+   double lot = CalcLotFromRisk(sl - bid, InpSwingRiskPct);
+
+   double slPips = (sl - bid) / g_PipSize;
+   double tpPips = (bid - tp) / g_PipSize;
+
+   trade.SetExpertMagicNumber(InpSwingMagic);
+   bool result = trade.Sell(lot, _Symbol, bid, sl, tp,
+                            StringFormat("ForgeSwing-SELL|ATR%.1f|RR%.1f", atrValue / g_PipSize, tpPips / slPips));
+   if(result)
+      PrintFormat("[SWING SELL] Lot=%.2f | Bid=%.5f | SL=%.5f (%.1fpip) | TP=%.5f (%.1fpip) | R:R=1:%.1f | Ticket=%I64u",
+                  lot, bid, sl, slPips, tp, tpPips, tpPips / slPips, trade.ResultOrder());
+   else
+      PrintFormat("[SWING SELL ERROR] %d | %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+  }
+
+//+------------------------------------------------------------------+
+//|  ══════════════════════════════════════════════════════════════   |
+//|  MODULE 5: UNIFIED POSITION MANAGER                              |
+//|  Handles ALL open positions regardless of engine (scalper/swing) |
+//|  Logic differs based on magic number:                            |
+//|   Scalper: tighter breakeven/trail, MACD zero-line exit          |
+//|   Swing:   wider breakeven/trail, TP already set (ATR-based)     |
+//|  NOTE (FIX 3): This is now the ONLY position manager. The old    |
+//|  ManagePosition() function has been completely removed.          |
+//|  ══════════════════════════════════════════════════════════════   |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+  {
+//--- Pre-load M1 MACD for scalper emergency exit logic
+   double macdMain[], macdSignal[];
    ArraySetAsSeries(macdMain,   true);
    ArraySetAsSeries(macdSignal, true);
-
    bool macdDataOK = (CopyBuffer(handleMACD_M1, 0, 0, 3, macdMain)   >= 3 &&
                       CopyBuffer(handleMACD_M1, 1, 0, 3, macdSignal) >= 3);
 
-   int totalPositions = PositionsTotal();
-   for(int i = totalPositions - 1; i >= 0; i--)
+   int totalPos = PositionsTotal();
+   for(int i = totalPos - 1; i >= 0; i--)
      {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket))
-         continue;
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() != _Symbol)        continue;
 
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-      if((int)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
-         continue;
+      int magic = (int)posInfo.Magic();
+      // Only manage our own trades
+      if(magic != InpScalperMagic && magic != InpSwingMagic) continue;
 
-      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      double currentSL = PositionGetDouble(POSITION_SL);
-      double currentTP = PositionGetDouble(POSITION_TP);
-      double volume    = PositionGetDouble(POSITION_VOLUME);
+      ulong  ticket    = posInfo.Ticket();
+      double openPrice = posInfo.PriceOpen();
+      double currentSL = posInfo.StopLoss();
+      double currentTP = posInfo.TakeProfit();
+      ENUM_POSITION_TYPE posType = posInfo.PositionType();
 
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      if(bid <= 0.0 || ask <= 0.0)
-         continue;
+      if(bid <= 0.0 || ask <= 0.0) continue;
 
-      double profitPips = 0.0;
-      if(posType == POSITION_TYPE_BUY)
-         profitPips = (bid - openPrice) / g_PipSize;
-      else
-         profitPips = (openPrice - ask) / g_PipSize;
+      double profitPips = (posType == POSITION_TYPE_BUY)
+                         ? (bid - openPrice) / g_PipSize
+                         : (openPrice - ask) / g_PipSize;
 
-//--- Emergency exit when MACD fully crosses zero against the open direction.
-      if(macdDataOK)
+      //─── SCALPER-SPECIFIC: MACD ZERO-LINE EMERGENCY EXIT ───────────
+      // Close scalper positions early if MACD crosses zero against the position
+      // while still in profit. Swing trades have their own TP — skip this.
+      if(magic == InpScalperMagic && macdDataOK)
         {
-         bool crossedBelowZero = (macdMain[1] < 0.0) && (macdMain[2] >= 0.0);
-         bool crossedAboveZero = (macdMain[1] > 0.0) && (macdMain[2] <= 0.0);
+         bool crossedBearish = (macdMain[1] < 0.0) && (macdMain[2] >= 0.0);
+         bool crossedBullish = (macdMain[1] > 0.0) && (macdMain[2] <= 0.0);
+         bool againstPos = (posType == POSITION_TYPE_BUY  && crossedBearish) ||
+                           (posType == POSITION_TYPE_SELL && crossedBullish);
 
-         bool againstPosition = false;
-         if(posType == POSITION_TYPE_BUY  && crossedBelowZero) againstPosition = true;
-         if(posType == POSITION_TYPE_SELL && crossedAboveZero) againstPosition = true;
-
-         if(againstPosition && profitPips > 0.0)
+         if(againstPos && profitPips > 0.0)
            {
-            if(ClosePositionByOrderSend(ticket, posType, volume))
-               PrintFormat("[MACD ZERO EXIT] Ticket %I64u closed at %.1f pips.", ticket, profitPips);
+            trade.SetExpertMagicNumber(InpScalperMagic);
+            if(trade.PositionClose(ticket, InpMaxSlippage))
+               PrintFormat("[MACD ZERO EXIT] Scalp ticket %I64u closed at %.1f pips.", ticket, profitPips);
             continue;
            }
         }
 
-//--- Breakeven trigger at 150 pips, then trail in 50-pip increments.
-      if(profitPips < InpBreakevenPips)
-         continue;
-
-      double protectedPips = InpBreakevenBuffer;
-      double extraPips = profitPips - InpBreakevenPips;
-      if(extraPips > 0.0)
+      //─── SELECT BREAKEVEN / TRAIL PARAMETERS BY ENGINE ─────────────
+      double bevenPips, bevenBuffer, trailStep;
+      if(magic == InpScalperMagic)
         {
-         int steps = (int)MathFloor(extraPips / InpTrailStepPips);
-         protectedPips += steps * InpTrailStepPips;
+         bevenPips   = InpBreakevenPips;
+         bevenBuffer = InpBreakevenBuffer;
+         trailStep   = InpTrailStepPips;
+        }
+      else // Swing uses wider parameters
+        {
+         bevenPips   = InpSwingBreakeven;
+         bevenBuffer = InpBreakevenBuffer * 3.0; // 3× wider buffer for swing
+         trailStep   = InpSwingTrailStep;
         }
 
+      //─── BREAKEVEN ACTIVATION ─────────────────────────────────────
+      if(profitPips < bevenPips) continue; // Not yet in profit threshold
+
       double newSL = 0.0;
+      double protectedPips = bevenBuffer;
+
+      // Calculate progressive trail pips beyond breakeven
+      double extraPips = profitPips - bevenPips;
+      if(extraPips > 0.0)
+         protectedPips += MathFloor(extraPips / trailStep) * trailStep;
+
       if(posType == POSITION_TYPE_BUY)
          newSL = openPrice + protectedPips * g_PipSize;
       else
          newSL = openPrice - protectedPips * g_PipSize;
 
+      //─── ENFORCE MINIMUM STOPS DISTANCE ───────────────────────────
       double minDist = (g_MinStopsLevel + 5) * g_PointSize;
-      if(posType == POSITION_TYPE_BUY && (bid - newSL) < minDist)
-         newSL = bid - minDist;
-      if(posType == POSITION_TYPE_SELL && (newSL - ask) < minDist)
-         newSL = ask + minDist;
-
+      if(posType == POSITION_TYPE_BUY  && (bid - newSL) < minDist) newSL = bid - minDist;
+      if(posType == POSITION_TYPE_SELL && (newSL - ask) < minDist) newSL = ask + minDist;
       newSL = NormalizeDouble(newSL, _Digits);
 
+      //─── ONLY MODIFY IF THE NEW SL IS ACTUALLY BETTER ─────────────
       bool shouldModify = false;
       if(posType == POSITION_TYPE_BUY)
-         shouldModify = (currentSL == 0.0 || newSL > currentSL + g_PointSize);
+         shouldModify = (currentSL < newSL - g_PointSize);  // New SL is higher (better for buy)
       else
-         shouldModify = (currentSL == 0.0 || newSL < currentSL - g_PointSize);
+         shouldModify = (currentSL == 0.0 || currentSL > newSL + g_PointSize); // New SL is lower
 
       if(shouldModify)
         {
-         if(ModifyPositionSLByOrderSend(ticket, newSL, currentTP))
-            PrintFormat("[TRAIL] Ticket %I64u | SL -> %.5f | Profit=%.1f pips", ticket, newSL, profitPips);
+         trade.SetExpertMagicNumber(magic);
+         if(trade.PositionModify(ticket, newSL, currentTP))
+            PrintFormat("[TRAIL] Ticket %I64u [%s] SL→%.5f | Profit=%.1f pips | Protected=%.1f pips",
+                        ticket, (magic == InpScalperMagic ? "SCALP" : "SWING"),
+                        newSL, profitPips, protectedPips);
         }
      }
   }
 
 //+------------------------------------------------------------------+
-//|  MISSING EXECUTION LOGIC: ISNEWSEVENT                             |
-//|  High-impact USD filter with pre-news netless straddle            |
-//+------------------------------------------------------------------+
-bool IsNewsEvent()
-  {
-   if(!InpEnableNewsFilter)
-      return false;
-
-   datetime now       = TimeCurrent();
-   datetime scanStart = now - (InpNewsPostMinutes + 1) * 60;
-   datetime scanEnd   = now + (InpNewsPreMinutes  + 1) * 60;
-
-   bool     newsBlackout       = false;
-   datetime nearestEventForStr = 0;
-
-   MqlCalendarValue values[];
-   int count = CalendarValueHistory(values, scanStart, scanEnd, "USD");
-   if(count > 0)
-     {
-      for(int i = 0; i < count; i++)
-        {
-         MqlCalendarEvent eventInfo;
-         if(!CalendarEventById(values[i].event_id, eventInfo))
-            continue;
-         if(eventInfo.importance != CALENDAR_IMPORTANCE_HIGH)
-            continue;
-
-         datetime eventTime = values[i].time;
-         long secToEvent    = (long)(eventTime - now);
-         long secAfterNews  = (long)(now - eventTime);
-
-         if((secToEvent > 0 && secToEvent <= InpNewsPreMinutes * 60) ||
-            (secAfterNews >= 0 && secAfterNews <= InpNewsPostMinutes * 60))
-           {
-            newsBlackout = true;
-            g_LastNewsEventTime = eventTime;
-           }
-
-         if(secToEvent > 0 && secToEvent <= InpStraddleMinutes * 60)
-           {
-            if(nearestEventForStr == 0 || secToEvent < (long)(nearestEventForStr - now))
-               nearestEventForStr = eventTime;
-           }
-        }
-     }
-
-//--- Keep straddle lifecycle active even when no new event is found in scan.
-   if(g_StraddlePlaced)
-      ManageStraddleExpiry();
-
-//--- Netless pre-news straddle only when account is flat.
-   if(nearestEventForStr > 0 && !g_StraddlePlaced && CountOpenPositions() == 0)
-      PlaceNetlessStraddle(nearestEventForStr);
-
-   return newsBlackout;
-  }
-
-//+------------------------------------------------------------------+
-//|  MISSING EXECUTION LOGIC: CALCULATELOTSIZE                        |
-//|  Hardcoded lot control to protect the $110 principal              |
-//+------------------------------------------------------------------+
-double CalculateLotSize()
-  {
-   return 0.01;
-  }
-
-//+------------------------------------------------------------------+
-//|  MODULE 1B: CHECK HARVEST TARGETS                                  |
-//|  Sends push notification and locks trading at each equity step     |
-//+------------------------------------------------------------------+
-void CheckHarvestTargets(double equity)
-  {
-//--- Step 1: $165 target
-   if(!g_HarvestLevel1Hit && equity >= InpHarvestTarget1)
-     {
-      g_HarvestLevel1Hit = true;
-      g_TradingLocked    = true;
-      string msg = StringFormat(
-                     "💰 TARGET 1 REACHED: Equity $%.2f. Withdraw $25. Leave $140. Restart Bot.",
-                     equity);
-      Print("[HARVEST-1] " + msg);
-      SendNotification("TARGET 1 REACHED: Equity $165. Withdraw $25. Leave $140. Restart Bot.");
-     }
-
-//--- Step 2: $210 target
-   if(!g_HarvestLevel2Hit && equity >= InpHarvestTarget2)
-     {
-      g_HarvestLevel2Hit = true;
-      g_TradingLocked    = true;
-      string msg = StringFormat(
-                     "💰 TARGET 2 REACHED: Equity $%.2f. Withdraw $35. Leave $175. Restart Bot.",
-                     equity);
-      Print("[HARVEST-2] " + msg);
-      SendNotification("TARGET 2 REACHED: Equity $210. Withdraw $35. Leave $175. Restart Bot.");
-     }
-
-//--- Step 3: $262.50 target
-   if(!g_HarvestLevel3Hit && equity >= InpHarvestTarget3)
-     {
-      g_HarvestLevel3Hit = true;
-      g_TradingLocked    = true;
-      string msg = StringFormat(
-                     "💰 TARGET 3 REACHED: Equity $%.2f. Withdraw $45. Leave $217. Restart Bot.",
-                     equity);
-      Print("[HARVEST-3] " + msg);
-      SendNotification("TARGET 3 REACHED: Equity $262. Withdraw $45. Leave $217. Restart Bot.");
-     }
-  }
-
-//+------------------------------------------------------------------+
-//|  MODULE 2: MACRO-TREND SHIELD — M15 EMA Analysis                  |
-//|  Returns: +1 = Bullish bias, -1 = Bearish bias, 0 = Neutral       |
-//+------------------------------------------------------------------+
-int GetMacroTrendBias()
-  {
-//--- Buffer arrays for EMA values (index 0 = most recent closed bar)
-   double ema200[], ema60[], ema30[];
-   ArraySetAsSeries(ema200, true);
-   ArraySetAsSeries(ema60,  true);
-   ArraySetAsSeries(ema30,  true);
-
-//--- Copy 3 values for each EMA (bar 0 = current, bar 1 = previous closed)
-   if(CopyBuffer(handleEMA200_M15, 0, 0, 3, ema200) < 3) return 0;
-   if(CopyBuffer(handleEMA60_M15,  0, 0, 3, ema60)  < 3) return 0;
-   if(CopyBuffer(handleEMA30_M15,  0, 0, 3, ema30)  < 3) return 0;
-
-//--- Use the last CLOSED bar (index 1) for stability — avoids repainting on live bar
-   double price200 = ema200[1];
-   double price60  = ema60[1];
-   double price30  = ema30[1];
-
-//--- Read current M15 close price (last closed bar)
-   double m15Close[];
-   ArraySetAsSeries(m15Close, true);
-   if(CopyClose(_Symbol, PERIOD_M15, 1, 1, m15Close) < 1) return 0;
-   double closePrice = m15Close[0];
-
-//--- BULLISH: Price > EMA200 AND EMA30 > EMA60 (fast above slow = uptrend)
-   if(closePrice > price200 && price30 > price60)
-      return 1;
-
-//--- BEARISH: Price < EMA200 AND EMA30 < EMA60 (fast below slow = downtrend)
-   if(closePrice < price200 && price30 < price60)
-      return -1;
-
-//--- NEUTRAL: Mixed signals — no trade authorization
-   return 0;
-  }
-
-//+------------------------------------------------------------------+
-//|  MODULE 3: MICRO-BURST EXECUTION SPEAR — M1 BB + MACD             |
-//|  Returns: +1 = Buy signal, -1 = Sell signal, 0 = No signal        |
-//+------------------------------------------------------------------+
-int GetMicroBurstSignal()
-  {
-//--- ── Bollinger Band Buffers ───────────────────────────────────────
-//    iBands buffer index: 0=middle, 1=upper, 2=lower
-   double fastUpper[], fastLower[], fastMiddle[];
-   double slowUpper[], slowLower[], slowMiddle[];
-
-   ArraySetAsSeries(fastUpper,  true); ArraySetAsSeries(fastLower,  true);
-   ArraySetAsSeries(fastMiddle, true); ArraySetAsSeries(slowUpper,  true);
-   ArraySetAsSeries(slowLower,  true); ArraySetAsSeries(slowMiddle, true);
-
-//--- Require 3 bars of history for signal confirmation
-   if(CopyBuffer(handleFastBB_M1, 1, 0, 3, fastUpper)  < 3) return 0;
-   if(CopyBuffer(handleFastBB_M1, 2, 0, 3, fastLower)  < 3) return 0;
-   if(CopyBuffer(handleFastBB_M1, 0, 0, 3, fastMiddle) < 3) return 0;
-   if(CopyBuffer(handleSlowBB_M1, 1, 0, 3, slowUpper)  < 3) return 0;
-   if(CopyBuffer(handleSlowBB_M1, 2, 0, 3, slowLower)  < 3) return 0;
-   if(CopyBuffer(handleSlowBB_M1, 0, 0, 3, slowMiddle) < 3) return 0;
-
-//--- ── MACD Buffers ─────────────────────────────────────────────────
-//    iMACD buffer index: 0=MACD main line, 1=Signal line
-   double macdMain[], macdSignal[];
-   ArraySetAsSeries(macdMain,   true);
-   ArraySetAsSeries(macdSignal, true);
-
-   if(CopyBuffer(handleMACD_M1, 0, 0, 3, macdMain)   < 3) return 0;
-   if(CopyBuffer(handleMACD_M1, 1, 0, 3, macdSignal) < 3) return 0;
-
-//--- Use last CLOSED bar (index 1) for entry confirmation to avoid false signals
-//    Also read the bar before that (index 2) to detect the actual cross
-   double fastUpp_1 = fastUpper[1],  fastUpp_2 = fastUpper[2];
-   double fastLow_1 = fastLower[1],  fastLow_2 = fastLower[2];
-   double slowUpp_1 = slowUpper[1],  slowUpp_2 = slowUpper[2];
-   double slowLow_1 = slowLower[1],  slowLow_2 = slowLower[2];
-
-   double macdMain_1   = macdMain[1],   macdMain_2   = macdMain[2];
-   double macdSignal_1 = macdSignal[1], macdSignal_2 = macdSignal[2];
-
-//--- ── BUY SIGNAL LOGIC ─────────────────────────────────────────────
-//    Condition A: Fast BB LOWER band moved BELOW Slow BB LOWER band
-//                 (fast band contracted below the slow band — squeeze/compression)
-   bool fastBBBelowSlow = (fastLow_1 < slowLow_1) && (fastLow_2 >= slowLow_2);
-
-//    Condition B: MACD crossed its Signal line UPWARD (bullish cross)
-//                 AND both MACD and Signal are in the OVERSOLD zone (below zero)
-   bool macdBullCross = (macdMain_1 > macdSignal_1) &&
-                        (macdMain_2 <= macdSignal_2) &&
-                        (macdMain_1 < 0.0) &&
-                        (macdSignal_1 < 0.0);
-
-   if(fastBBBelowSlow && macdBullCross)
-      return 1; // BUY signal confirmed
-
-//--- ── SELL SIGNAL LOGIC ────────────────────────────────────────────
-//    Condition A: Fast BB UPPER band moved ABOVE Slow BB UPPER band
-//                 (fast band expanded above slow band — overbought expansion)
-   bool fastBBAboveSlow = (fastUpp_1 > slowUpp_1) && (fastUpp_2 <= slowUpp_2);
-
-//    Condition B: MACD crossed its Signal line DOWNWARD (bearish cross)
-//                 AND both MACD and Signal are in the OVERBOUGHT zone (above zero)
-   bool macdBearCross = (macdMain_1 < macdSignal_1) &&
-                        (macdMain_2 >= macdSignal_2) &&
-                        (macdMain_1 > 0.0) &&
-                        (macdSignal_1 > 0.0);
-
-   if(fastBBAboveSlow && macdBearCross)
-      return -1; // SELL signal confirmed
-
-   return 0; // No signal
-  }
-
-//+------------------------------------------------------------------+
-//|  EXECUTE BUY ORDER                                                 |
-//|  SL = Fast BB lower band, capped at InpMaxSLPips                   |
-//+------------------------------------------------------------------+
-void ExecuteBuy()
-  {
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   if(ask <= 0) return;
-   double lot = CalculateLotSize();
-
-//--- Get current Fast BB lower band value for stop loss placement
-   double fastLower[];
-   ArraySetAsSeries(fastLower, true);
-   if(CopyBuffer(handleFastBB_M1, 2, 0, 2, fastLower) < 2) return;
-
-   double rawSL = fastLower[1]; // Lower BB of last closed M1 bar
-
-//--- Cap the SL distance at InpMaxSLPips to protect micro-balance
-   double maxSLPrice = ask - (InpMaxSLPips * g_PipSize);
-   double sl = MathMax(rawSL, maxSLPrice); // Use whichever is higher (closer to price)
-
-//--- Enforce broker's minimum stops level
-   double minSLDistance = (g_MinStopsLevel + 5) * g_PointSize; // +5 point buffer for safety
-   if((ask - sl) < minSLDistance)
-      sl = ask - minSLDistance;
-
-//--- Normalize prices to broker tick size
-   sl = NormalizeDouble(sl, _Digits);
-
-//--- No predefined take profit — exit managed dynamically by trailing logic
-   double tp = 0.0;
-
-//--- Validate the order before sending
-   if(sl >= ask)
-     {
-      PrintFormat("[BUY] Invalid SL %.5f >= ASK %.5f. Skipping.", sl, ask);
-      return;
-     }
-
-   bool result = trade.Buy(lot, _Symbol, ask, sl, tp,
-                           StringFormat("ScalperBuy | SL@%.5f", sl));
-   if(result)
-      PrintFormat("[BUY ENTRY] Lot=%.2f | Ask=%.5f | SL=%.5f | Ticket=%I64u",
-                  lot, ask, sl, trade.ResultOrder());
-   else
-      PrintFormat("[BUY ERROR] Code=%d | %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
-  }
-
-//+------------------------------------------------------------------+
-//|  EXECUTE SELL ORDER                                                |
-//|  SL = Fast BB upper band, capped at InpMaxSLPips                   |
-//+------------------------------------------------------------------+
-void ExecuteSell()
-  {
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(bid <= 0) return;
-   double lot = CalculateLotSize();
-
-//--- Get current Fast BB upper band value for stop loss placement
-   double fastUpper[];
-   ArraySetAsSeries(fastUpper, true);
-   if(CopyBuffer(handleFastBB_M1, 1, 0, 2, fastUpper) < 2) return;
-
-   double rawSL = fastUpper[1]; // Upper BB of last closed M1 bar
-
-//--- Cap the SL distance at InpMaxSLPips
-   double maxSLPrice = bid + (InpMaxSLPips * g_PipSize);
-   double sl = MathMin(rawSL, maxSLPrice); // Use whichever is lower (closer to price)
-
-//--- Enforce broker's minimum stops level
-   double minSLDistance = (g_MinStopsLevel + 5) * g_PointSize;
-   if((sl - bid) < minSLDistance)
-      sl = bid + minSLDistance;
-
-//--- Normalize prices
-   sl = NormalizeDouble(sl, _Digits);
-
-   double tp = 0.0;
-
-//--- Validate
-   if(sl <= bid)
-     {
-      PrintFormat("[SELL] Invalid SL %.5f <= BID %.5f. Skipping.", sl, bid);
-      return;
-     }
-
-   bool result = trade.Sell(lot, _Symbol, bid, sl, tp,
-                            StringFormat("ScalperSell | SL@%.5f", sl));
-   if(result)
-      PrintFormat("[SELL ENTRY] Lot=%.2f | Bid=%.5f | SL=%.5f | Ticket=%I64u",
-                  lot, bid, sl, trade.ResultOrder());
-   else
-      PrintFormat("[SELL ERROR] Code=%d | %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
-  }
-
-//+------------------------------------------------------------------+
-//|  MODULE 4: DYNAMIC TRAILING EXIT MATRIX                            |
-//|  Manages ALL open positions: Breakeven, Trailing, MACD Exit        |
-//+------------------------------------------------------------------+
-void ManageOpenPositions()
-  {
-//--- Read current MACD for emergency exit logic
-   double macdMain[], macdSignal[];
-   ArraySetAsSeries(macdMain,   true);
-   ArraySetAsSeries(macdSignal, true);
-   bool macdDataOK = (CopyBuffer(handleMACD_M1, 0, 0, 3, macdMain)   >= 3 &&
-                      CopyBuffer(handleMACD_M1, 1, 0, 3, macdSignal) >= 3);
-
-   int totalPositions = PositionsTotal();
-
-   for(int i = totalPositions - 1; i >= 0; i--)
-     {
-      //--- Select position by index and filter by our magic number + symbol
-      if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Magic()  != InpMagicNumber) continue;
-      if(posInfo.Symbol() != _Symbol)        continue;
-
-      ulong  ticket     = posInfo.Ticket();
-      double openPrice  = posInfo.PriceOpen();
-      double currentSL  = posInfo.StopLoss();
-      double posType    = posInfo.PositionType(); // POSITION_TYPE_BUY or POSITION_TYPE_SELL
-      double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-      //--- Calculate floating profit in PIPS
-      double profitPips = 0.0;
-      if(posType == POSITION_TYPE_BUY)
-         profitPips = (currentBid - openPrice) / g_PipSize;
-      else
-         profitPips = (openPrice - currentAsk) / g_PipSize;
-
-      //═══════════════════════════════════════════════════════════════
-      //  4A: MACD ZERO-LINE CROSS EMERGENCY EXIT
-      //  If MACD crosses the zero line AGAINST the position → close now
-      //═══════════════════════════════════════════════════════════════
-      if(macdDataOK)
-        {
-         bool macdCrossedZeroBearish = (macdMain[1] < 0.0) && (macdMain[2] >= 0.0);
-         bool macdCrossedZeroBullish = (macdMain[1] > 0.0) && (macdMain[2] <= 0.0);
-
-         bool emergencyExit = false;
-         if(posType == POSITION_TYPE_BUY  && macdCrossedZeroBearish) emergencyExit = true;
-         if(posType == POSITION_TYPE_SELL && macdCrossedZeroBullish) emergencyExit = true;
-
-         if(emergencyExit && profitPips > 0) // Only close if we're in profit (protect floating gain)
-           {
-            PrintFormat("[MACD ZERO EXIT] Ticket %I64u | Type=%s | ProfitPips=%.1f",
-                        ticket, (posType == POSITION_TYPE_BUY ? "BUY" : "SELL"), profitPips);
-            trade.PositionClose(ticket, InpMaxSlippage);
-            continue; // Move to next position
-           }
-        }
-
-      //═══════════════════════════════════════════════════════════════
-      //  4B: BREAKEVEN ACTIVATION (at InpBreakevenPips profit)
-      //═══════════════════════════════════════════════════════════════
-      double breakEvenSL    = 0.0;
-      double breakEvenPips  = InpBreakevenPips;
-      double bufferPips     = InpBreakevenBuffer;
-
-      if(profitPips >= breakEvenPips)
-        {
-         //--- Calculate breakeven SL with buffer
-         if(posType == POSITION_TYPE_BUY)
-            breakEvenSL = NormalizeDouble(openPrice + bufferPips * g_PipSize, _Digits);
-         else
-            breakEvenSL = NormalizeDouble(openPrice - bufferPips * g_PipSize, _Digits);
-
-         //--- Only modify if the new SL is better (further from entry in profit direction)
-         bool needsBreakeven = false;
-         if(posType == POSITION_TYPE_BUY  && breakEvenSL > currentSL + g_PointSize)
-            needsBreakeven = true;
-         if(posType == POSITION_TYPE_SELL && (currentSL == 0.0 || breakEvenSL < currentSL - g_PointSize))
-            needsBreakeven = true;
-
-         if(needsBreakeven)
-           {
-            //--- Enforce minimum stop distance from current price
-            double minDist = (g_MinStopsLevel + 5) * g_PointSize;
-            if(posType == POSITION_TYPE_BUY && (currentBid - breakEvenSL) < minDist)
-               breakEvenSL = NormalizeDouble(currentBid - minDist, _Digits);
-            if(posType == POSITION_TYPE_SELL && (breakEvenSL - currentAsk) < minDist)
-               breakEvenSL = NormalizeDouble(currentAsk + minDist, _Digits);
-
-            if(trade.PositionModify(ticket, breakEvenSL, posInfo.TakeProfit()))
-               PrintFormat("[BREAKEVEN] Ticket %I64u | SL moved to %.5f (+%.1f pip buffer)",
-                           ticket, breakEvenSL, bufferPips);
-            continue;
-           }
-
-         //═══════════════════════════════════════════════════════════
-         //  4C: STEP TRAILING STOP (activates after breakeven is set)
-         //  Moves SL in InpTrailStepPips increments as profit grows
-         //═══════════════════════════════════════════════════════════
-         double trailStep = InpTrailStepPips * g_PipSize;
-         double newTrailSL = 0.0;
-
-         if(posType == POSITION_TYPE_BUY)
-           {
-            //--- Trail SL = current price minus one trail step
-            //    Only advance if new SL is more than one step ahead of current SL
-            double candidateSL = NormalizeDouble(currentBid - trailStep, _Digits);
-            if(candidateSL > currentSL + trailStep)
-               newTrailSL = candidateSL;
-           }
-         else // SELL
-           {
-            double candidateSL = NormalizeDouble(currentAsk + trailStep, _Digits);
-            if(currentSL == 0.0 || candidateSL < currentSL - trailStep)
-               newTrailSL = candidateSL;
-           }
-
-         if(newTrailSL > 0.0)
-           {
-            //--- Enforce minimum stop distance
-            double minDist = (g_MinStopsLevel + 5) * g_PointSize;
-            if(posType == POSITION_TYPE_BUY && (currentBid - newTrailSL) < minDist)
-               newTrailSL = NormalizeDouble(currentBid - minDist, _Digits);
-            if(posType == POSITION_TYPE_SELL && (newTrailSL - currentAsk) < minDist)
-               newTrailSL = NormalizeDouble(currentAsk + minDist, _Digits);
-
-            if(trade.PositionModify(ticket, newTrailSL, posInfo.TakeProfit()))
-               PrintFormat("[TRAIL] Ticket %I64u | SL advanced to %.5f | Profit: %.1f pips",
-                           ticket, newTrailSL, profitPips);
-           }
-        }
-     }
-  }
-
-//+------------------------------------------------------------------+
-//|  MODULE 5: SMART NEWS — CHECK ECONOMIC CALENDAR                    |
-//|  Scans for HIGH IMPACT USD events                                  |
-//|  Sets newsBlackout and straddleWindow flags                        |
+//|  MODULE 6: NEWS CALENDAR SCAN                                    |
+//|  Outputs: newsBlackout and straddleWindow flags                  |
 //+------------------------------------------------------------------+
 void CheckNewsCalendar(bool &newsBlackout, bool &straddleWindow)
   {
    newsBlackout   = false;
    straddleWindow = false;
 
-   datetime now        = TimeCurrent();
-   datetime scanStart  = now - (InpNewsPostMinutes  + 1) * 60; // Look back post-window
-   datetime scanEnd    = now + (InpNewsPreMinutes    + 1) * 60; // Look forward pre-window
+   datetime now       = TimeCurrent();
+   datetime scanStart = now - (InpNewsPostMinutes + 1) * 60;
+   datetime scanEnd   = now + (InpNewsPreMinutes  + 1) * 60;
 
-//--- Fetch calendar events in the scan window
    MqlCalendarValue values[];
    int count = CalendarValueHistory(values, scanStart, scanEnd, "USD");
-   if(count <= 0) return; // No USD events in range
+   if(count <= 0) return;
 
    for(int i = 0; i < count; i++)
      {
-      //--- Only process HIGH impact events
-      MqlCalendarEvent eventInfo;
-      if(!CalendarEventById(values[i].event_id, eventInfo)) continue;
-      if(eventInfo.importance != CALENDAR_IMPORTANCE_HIGH)   continue;
+      MqlCalendarEvent ev;
+      if(!CalendarEventById(values[i].event_id, ev)) continue;
+      if(ev.importance != CALENDAR_IMPORTANCE_HIGH)  continue;
 
-      datetime eventTime = values[i].time; // Actual scheduled event time
+      datetime eventTime  = values[i].time;
+      long secToEvent    = (long)(eventTime - now);
+      long secAfterEvent = (long)(now - eventTime);
 
-      //--- Time differences in seconds
-      long secToEvent   = (long)(eventTime - now); // Positive = future, Negative = past
-      long secAfterNews = (long)(now - eventTime); // How long since news fired
-
-      //--- PRE-NEWS BLACKOUT: 15 minutes before event
+      // Pre-news blackout
       if(secToEvent > 0 && secToEvent <= InpNewsPreMinutes * 60)
-        {
-         newsBlackout = true;
-         g_NewsEventTimestamp = eventTime;
-        }
+        { newsBlackout = true; g_NewsEventTimestamp = eventTime; }
 
-      //--- POST-NEWS BLACKOUT: 15 minutes after event
-      if(secAfterNews >= 0 && secAfterNews <= InpNewsPostMinutes * 60)
-        {
+      // Post-news blackout
+      if(secAfterEvent >= 0 && secAfterEvent <= InpNewsPostMinutes * 60)
          newsBlackout = true;
-        }
 
-      //--- STRADDLE WINDOW: exactly 2 minutes before event (and blackout active)
+      // Straddle window (2 minutes before event)
       if(secToEvent > 0 && secToEvent <= InpStraddleMinutes * 60)
-        {
-         straddleWindow = true;
-         g_NewsEventTimestamp = eventTime;
-        }
+        { straddleWindow = true; g_NewsEventTimestamp = eventTime; }
      }
   }
 
 //+------------------------------------------------------------------+
-//|  MODULE 5: PLACE NEWS STRADDLE                                     |
-//|  Buy Stop 150 pips above + Sell Stop 150 pips below current price  |
+//|  MODULE 6: NETLESS STRADDLE PLACEMENT (OrderSend version)        |
+//|  Atomic: if either leg fails, the other is immediately cancelled |
 //+------------------------------------------------------------------+
-void PlaceNewsStraddle()
+void PlaceNetlessStraddle(datetime eventTime)
   {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(ask <= 0 || bid <= 0) return;
+   if(ask <= 0.0 || bid <= 0.0) return;
 
-   double midPrice    = (ask + bid) / 2.0;
-   double straddleDist = InpStraddlePips * g_PipSize;
+   double mid  = (ask + bid) / 2.0;
+   double dist = InpStraddlePips * g_PipSize;
 
-   double buyStopPrice  = NormalizeDouble(midPrice + straddleDist, _Digits);
-   double sellStopPrice = NormalizeDouble(midPrice - straddleDist, _Digits);
+   double buyStopPrice  = NormalizeDouble(mid + dist, _Digits);
+   double sellStopPrice = NormalizeDouble(mid - dist, _Digits);
 
-//--- Enforce minimum stop distance from current price
    double minDist = (g_MinStopsLevel + 10) * g_PointSize;
-   if(buyStopPrice  - ask < minDist) buyStopPrice  = NormalizeDouble(ask  + minDist, _Digits);
-   if(bid - sellStopPrice < minDist) sellStopPrice = NormalizeDouble(bid  - minDist, _Digits);
+   if(buyStopPrice  - ask < minDist) buyStopPrice  = NormalizeDouble(ask + minDist, _Digits);
+   if(bid - sellStopPrice < minDist) sellStopPrice = NormalizeDouble(bid - minDist, _Digits);
 
-//--- Expiry: 10 minutes from now (gives time for both legs to be placed)
-   datetime expiry = TimeCurrent() + 600;
+   datetime expiry = eventTime + InpStraddleExpiry * 60;
+   double lot      = CalcLotFromRisk(InpMaxSLPips * g_PipSize, InpScalperRiskPct);
 
-//--- Place Buy Stop with basic SL/TP (managed dynamically post-trigger)
-   double bsSlPrice = NormalizeDouble(buyStopPrice  - InpMaxSLPips * g_PipSize, _Digits);
-   double ssSlPrice = NormalizeDouble(sellStopPrice + InpMaxSLPips * g_PipSize, _Digits);
+   MqlTradeRequest reqB, reqS;
+   MqlTradeResult  resB, resS;
+   ZeroMemory(reqB); ZeroMemory(reqS); ZeroMemory(resB); ZeroMemory(resS);
 
-   if(trade.BuyStop(InpLotSize, buyStopPrice, _Symbol, bsSlPrice, 0.0,
-                    ORDER_TIME_SPECIFIED, expiry, "NewsStraddleBuy"))
+   // BUY STOP leg
+   reqB.action       = TRADE_ACTION_PENDING;
+   reqB.symbol       = _Symbol;
+   reqB.magic        = InpScalperMagic;
+   reqB.volume       = lot;
+   reqB.type         = ORDER_TYPE_BUY_STOP;
+   reqB.price        = buyStopPrice;
+   reqB.sl           = NormalizeDouble(buyStopPrice - InpMaxSLPips * g_PipSize, _Digits);
+   reqB.tp           = 0.0;
+   reqB.deviation    = InpMaxSlippage;
+   reqB.type_filling = ORDER_FILLING_RETURN;
+   reqB.type_time    = ORDER_TIME_SPECIFIED;
+   reqB.expiration   = expiry;
+   reqB.comment      = "Straddle-BUY";
+
+   // SELL STOP leg
+   reqS.action       = TRADE_ACTION_PENDING;
+   reqS.symbol       = _Symbol;
+   reqS.magic        = InpScalperMagic;
+   reqS.volume       = lot;
+   reqS.type         = ORDER_TYPE_SELL_STOP;
+   reqS.price        = sellStopPrice;
+   reqS.sl           = NormalizeDouble(sellStopPrice + InpMaxSLPips * g_PipSize, _Digits);
+   reqS.tp           = 0.0;
+   reqS.deviation    = InpMaxSlippage;
+   reqS.type_filling = ORDER_FILLING_RETURN;
+   reqS.type_time    = ORDER_TIME_SPECIFIED;
+   reqS.expiration   = expiry;
+   reqS.comment      = "Straddle-SELL";
+
+   bool bPlaced = OrderSend(reqB, resB) &&
+                  (resB.retcode == TRADE_RETCODE_DONE || resB.retcode == TRADE_RETCODE_PLACED);
+   bool sPlaced = OrderSend(reqS, resS) &&
+                  (resS.retcode == TRADE_RETCODE_DONE || resS.retcode == TRADE_RETCODE_PLACED);
+
+//--- Netless rule: if either leg failed, cancel both
+   if(!(bPlaced && sPlaced))
      {
-      g_StraddleBuyTicket = trade.ResultOrder();
-      PrintFormat("[STRADDLE] Buy Stop placed @ %.5f | SL @ %.5f | Ticket %I64u",
-                  buyStopPrice, bsSlPrice, g_StraddleBuyTicket);
+      if(resB.order > 0) CancelPendingByTicket(resB.order);
+      if(resS.order > 0) CancelPendingByTicket(resS.order);
+      PrintFormat("[STRADDLE ERROR] Netless rollback. Buy ret=%d | Sell ret=%d",
+                  resB.retcode, resS.retcode);
+      return;
      }
-   else
-      PrintFormat("[STRADDLE ERROR] BuyStop failed: %d | %s",
-                  trade.ResultRetcode(), trade.ResultRetcodeDescription());
 
-   if(trade.SellStop(InpLotSize, sellStopPrice, _Symbol, ssSlPrice, 0.0,
-                     ORDER_TIME_SPECIFIED, expiry, "NewsStraddleSell"))
-     {
-      g_StraddleSellTicket = trade.ResultOrder();
-      PrintFormat("[STRADDLE] Sell Stop placed @ %.5f | SL @ %.5f | Ticket %I64u",
-                  sellStopPrice, ssSlPrice, g_StraddleSellTicket);
-     }
-   else
-      PrintFormat("[STRADDLE ERROR] SellStop failed: %d | %s",
-                  trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   g_StraddleBuyTicket  = resB.order;
+   g_StraddleSellTicket = resS.order;
+   g_StraddlePlaced     = true;
+   g_StraddlePlacedAt   = TimeCurrent();
+   g_NewsEventTimestamp = eventTime;
 
-//--- Mark straddle as active
-   g_StraddlePlaced    = true;
-   g_StraddlePlacedAt  = TimeCurrent();
-   PrintFormat("[STRADDLE] Active | NewsEvent @ %s | BuyStop=%I64u | SellStop=%I64u",
-               TimeToString(g_NewsEventTimestamp), g_StraddleBuyTicket, g_StraddleSellTicket);
+   PrintFormat("[STRADDLE] Buy=%I64u @ %.5f | Sell=%I64u @ %.5f | Event=%s",
+               g_StraddleBuyTicket, buyStopPrice,
+               g_StraddleSellTicket, sellStopPrice,
+               TimeToString(eventTime));
   }
 
 //+------------------------------------------------------------------+
-//|  MODULE 5: MANAGE STRADDLE EXPIRY                                  |
-//|  Cancel the untriggered leg 5 minutes after the news release       |
+//|  MODULE 6: STRADDLE EXPIRY MANAGER                               |
 //+------------------------------------------------------------------+
 void ManageStraddleExpiry()
   {
-   if(!g_StraddlePlaced) return;
-   if(g_NewsEventTimestamp == 0) return;
+   if(!g_StraddlePlaced || g_NewsEventTimestamp == 0) return;
 
-   datetime now = TimeCurrent();
-   long secAfterNews = (long)(now - g_NewsEventTimestamp);
+   long secAfterNews = (long)(TimeCurrent() - g_NewsEventTimestamp);
+   if(secAfterNews < InpStraddleExpiry * 60) return;
 
-//--- Check if 5 minutes have elapsed since the news release
-   if(secAfterNews >= InpStraddleExpiry * 60)
+   PrintFormat("[STRADDLE EXPIRY] %d min elapsed. Cancelling untriggered leg(s).", InpStraddleExpiry);
+
+   if(g_StraddleBuyTicket > 0 && OrderSelect(g_StraddleBuyTicket))
      {
-      PrintFormat("[STRADDLE EXPIRY] %d minutes elapsed since news. Cancelling untriggered leg(s).", InpStraddleExpiry);
-
-      //--- Cancel Buy Stop if still pending (not triggered)
-      if(g_StraddleBuyTicket > 0 && OrderSelect(g_StraddleBuyTicket))
-        {
-         if(trade.OrderDelete(g_StraddleBuyTicket))
-            PrintFormat("[STRADDLE] Buy Stop %I64u cancelled (expired).", g_StraddleBuyTicket);
-         g_StraddleBuyTicket = 0;
-        }
-
-      //--- Cancel Sell Stop if still pending
-      if(g_StraddleSellTicket > 0 && OrderSelect(g_StraddleSellTicket))
-        {
-         if(trade.OrderDelete(g_StraddleSellTicket))
-            PrintFormat("[STRADDLE] Sell Stop %I64u cancelled (expired).", g_StraddleSellTicket);
-         g_StraddleSellTicket = 0;
-        }
-
-      //--- Reset straddle state
-      g_StraddlePlaced      = false;
-      g_StraddlePlacedAt    = 0;
-      g_NewsEventTimestamp  = 0;
+      CancelPendingByTicket(g_StraddleBuyTicket);
+      g_StraddleBuyTicket = 0;
      }
+   if(g_StraddleSellTicket > 0 && OrderSelect(g_StraddleSellTicket))
+     {
+      CancelPendingByTicket(g_StraddleSellTicket);
+      g_StraddleSellTicket = 0;
+     }
+
+   g_StraddlePlaced     = false;
+   g_StraddlePlacedAt   = 0;
+   g_NewsEventTimestamp = 0;
   }
 
 //+------------------------------------------------------------------+
-//|  UTILITY: CLOSE ALL OPEN POSITIONS (Emergency Use)                 |
+//|  MODULE 1: HARVEST TARGET CHECKER                                |
+//|  At each milestone: notify, lock new entries, instruct user      |
 //+------------------------------------------------------------------+
-void CloseAllPositions()
+void CheckHarvestTargets(double equity)
   {
-   Print("[EMERGENCY CLOSE] Closing ALL positions for symbol: ", _Symbol);
-   int total = PositionsTotal();
-   for(int i = total - 1; i >= 0; i--)
+   if(!g_HarvestLevel1Hit && equity >= InpHarvestTarget1)
      {
-      if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Symbol() != _Symbol) continue;
-      ulong ticket = posInfo.Ticket();
-      if(trade.PositionClose(ticket, InpMaxSlippage))
-         PrintFormat("[EMERGENCY CLOSE] Ticket %I64u closed.", ticket);
-      else
-         PrintFormat("[EMERGENCY CLOSE ERROR] Ticket %I64u failed: %d | %s",
-                     ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      g_HarvestLevel1Hit = true;
+      g_TradingLocked    = true;
+      string msg = StringFormat("TARGET 1 HIT: Equity $%.2f | Withdraw $25 → Leave $140 → Restart EA", equity);
+      Print("[HARVEST-1] " + msg);
+      SendNotification("💰 " + msg);
+     }
+   if(!g_HarvestLevel2Hit && equity >= InpHarvestTarget2)
+     {
+      g_HarvestLevel2Hit = true;
+      g_TradingLocked    = true;
+      string msg = StringFormat("TARGET 2 HIT: Equity $%.2f | Withdraw $35 → Leave $175 → Restart EA", equity);
+      Print("[HARVEST-2] " + msg);
+      SendNotification("💰 " + msg);
+     }
+   if(!g_HarvestLevel3Hit && equity >= InpHarvestTarget3)
+     {
+      g_HarvestLevel3Hit = true;
+      g_TradingLocked    = true;
+      string msg = StringFormat("TARGET 3 HIT: Equity $%.2f | Withdraw $45 → Leave $217 → Restart EA", equity);
+      Print("[HARVEST-3] " + msg);
+      SendNotification("💰 " + msg);
      }
   }
 
 //+------------------------------------------------------------------+
-//|  UTILITY: CANCEL ALL PENDING ORDERS                                |
+//|  MODULE 7: SESSION FILTER (FIX 4)                                |
+//|  Returns true if current GMT time is within trading session      |
+//|  Default: 08:00–17:00 GMT (London open through NY midday)        |
+//|  This eliminates low-liquidity Asian session noise on M1.        |
 //+------------------------------------------------------------------+
-void CancelAllPendingOrders()
+bool IsInSession()
   {
-   int total = OrdersTotal();
-   for(int i = total - 1; i >= 0; i--)
-     {
-      if(!orderInfo.SelectByIndex(i)) continue;
-      if(orderInfo.Symbol() != _Symbol) continue;
-      if(orderInfo.Magic()  != InpMagicNumber) continue;
-      ulong ticket = orderInfo.Ticket();
-      if(trade.OrderDelete(ticket))
-         PrintFormat("[CANCEL ORDER] Pending order %I64u deleted.", ticket);
-     }
+   if(!InpEnableSession) return true; // Filter disabled — always trade
+
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(), dt); // Use GMT time for consistency across brokers
+   int hour = dt.hour;
+
+   // Allow trading within session window
+   if(hour >= InpSessionStartHour && hour < InpSessionEndHour)
+      return true;
+
+   return false;
   }
 
 //+------------------------------------------------------------------+
-//|  UTILITY: COUNT OPEN POSITIONS FOR THIS EA                         |
+//|  DYNAMIC LOT SIZE CALCULATOR (FIX 5)                             |
+//|  Calculates lot size based on % equity risk and SL distance      |
+//|  Formula: Lots = (Equity × RiskPct%) / (SL_price × TickValue)   |
 //+------------------------------------------------------------------+
-int CountOpenPositions()
+double CalcLotFromRisk(double slPriceDistance, double riskPct)
+  {
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskAmount = equity * (riskPct / 100.0);  // Dollar risk amount
+
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0.0 || tickValue <= 0.0 || slPriceDistance <= 0.0)
+      return InpMinLotSize;
+
+   // Convert SL distance to ticks, then to dollar loss per lot
+   double ticksInSL   = slPriceDistance / tickSize;
+   double dollarPerLot = ticksInSL * tickValue;
+   if(dollarPerLot <= 0.0) return InpMinLotSize;
+
+   double rawLots = riskAmount / dollarPerLot;
+
+   // Normalize to broker's lot step
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lotStep > 0.0) rawLots = MathFloor(rawLots / lotStep) * lotStep;
+
+   // Clamp within [Min, Max] bounds
+   rawLots = MathMax(rawLots, InpMinLotSize);
+   rawLots = MathMin(rawLots, InpMaxLotSize);
+
+   return NormalizeDouble(rawLots, 2);
+  }
+
+//+------------------------------------------------------------------+
+//|  UTILITY: COUNT OPEN POSITIONS BY MAGIC NUMBER                   |
+//+------------------------------------------------------------------+
+int CountPositionsByMagic(int magicNumber)
   {
    int count = 0;
-   int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
+   for(int i = 0; i < PositionsTotal(); i++)
      {
       if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Magic()  != InpMagicNumber) continue;
       if(posInfo.Symbol() != _Symbol)        continue;
+      if((int)posInfo.Magic() != magicNumber) continue;
       count++;
      }
    return count;
   }
 
 //+------------------------------------------------------------------+
-//|  UTILITY: LIVE CHART STATUS COMMENT                                |
+//|  UTILITY: CLOSE ALL POSITIONS (Emergency Use)                    |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+  {
+   Print("[EMERGENCY CLOSE] Flattening all positions...");
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() != _Symbol) continue;
+      ulong ticket = posInfo.Ticket();
+      trade.PositionClose(ticket, InpMaxSlippage);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  UTILITY: CANCEL ALL PENDING ORDERS FOR THIS EA                  |
+//+------------------------------------------------------------------+
+void CancelAllPendingOrders()
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!orderInfo.SelectByIndex(i)) continue;
+      if(orderInfo.Symbol() != _Symbol) continue;
+      if(orderInfo.Magic() != InpScalperMagic && orderInfo.Magic() != InpSwingMagic) continue;
+      CancelPendingByTicket(orderInfo.Ticket());
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  UTILITY: CANCEL A SINGLE PENDING ORDER BY TICKET                |
+//+------------------------------------------------------------------+
+bool CancelPendingByTicket(ulong orderTicket)
+  {
+   if(orderTicket == 0) return false;
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action = TRADE_ACTION_REMOVE;
+   req.order  = orderTicket;
+   req.symbol = _Symbol;
+   if(!OrderSend(req, res)) return false;
+   return (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED);
+  }
+
+//+------------------------------------------------------------------+
+//|  UTILITY: CHART STATUS COMMENT                                   |
 //+------------------------------------------------------------------+
 void UpdateChartComment(double equity, long spread)
   {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double margin  = AccountInfoDouble(ACCOUNT_MARGIN);
+   int    scalps  = CountPositionsByMagic(InpScalperMagic);
+   int    swings  = CountPositionsByMagic(InpSwingMagic);
 
    string status = g_EmergencyShutdown ? "⛔ EMERGENCY HALT" :
-                   g_TradingLocked     ? "🔒 TRADING LOCKED (Harvest)" :
-                   "✅ TRADING ACTIVE";
+                   g_TradingLocked     ? "🔒 HARVEST LOCKED" :
+                   !IsInSession()      ? "🌙 OUTSIDE SESSION" :
+                                         "✅ DUAL-ENGINE ACTIVE";
 
    string commentText = StringFormat(
-                          "═══ XAUUSDm Precision Scalper ═══\n"
-                          "Status   : %s\n"
-                          "Equity   : $%.2f  |  Balance: $%.2f\n"
-                          "Spread   : %d pts  |  Margin: $%.2f\n"
-                          "Hard Floor: $%.2f  |  Positions: %d\n"
-                          "Harvest 1: $%.2f [%s]\n"
-                          "Harvest 2: $%.2f [%s]\n"
-                          "Harvest 3: $%.2f [%s]\n"
-                          "News Guard: %s  |  Straddle: %s\n"
-                          "═══════════════════════════════════",
-                          status,
-                          equity, balance,
-                          spread, margin,
-                          InpHardFloorEquity, CountOpenPositions(),
-                          InpHarvestTarget1, g_HarvestLevel1Hit ? "HIT ✓" : "Pending",
-                          InpHarvestTarget2, g_HarvestLevel2Hit ? "HIT ✓" : "Pending",
-                          InpHarvestTarget3, g_HarvestLevel3Hit ? "HIT ✓" : "Pending",
-                          InpEnableNewsFilter ? "ON" : "OFF",
-                          g_StraddlePlaced    ? "ACTIVE" : "None"
-                        );
+     "═══ ForgeScalper v2.0 ═══════════════\n"
+     "Status   : %s\n"
+     "Equity   : $%.2f  |  Balance: $%.2f\n"
+     "Spread   : %d pts  |  Margin : $%.2f\n"
+     "───────────────────────────────────\n"
+     "Engine 1 [M1 Scalper] : %d position(s)\n"
+     "Engine 2 [H1 Swing]   : %d position(s)\n"
+     "Straddle Active       : %s\n"
+     "───────────────────────────────────\n"
+     "Hard Floor : $%.2f\n"
+     "Harvest 1  : $%.2f  [%s]\n"
+     "Harvest 2  : $%.2f  [%s]\n"
+     "Harvest 3  : $%.2f  [%s]\n"
+     "News Guard : %s\n"
+     "═══════════════════════════════════",
+     status,
+     equity, balance,
+     spread, margin,
+     scalps,
+     swings,
+     g_StraddlePlaced ? "YES — Legs active" : "None",
+     InpHardFloorEquity,
+     InpHarvestTarget1, g_HarvestLevel1Hit ? "✓ HIT" : "Pending",
+     InpHarvestTarget2, g_HarvestLevel2Hit ? "✓ HIT" : "Pending",
+     InpHarvestTarget3, g_HarvestLevel3Hit ? "✓ HIT" : "Pending",
+     InpEnableNewsFilter ? "ON" : "OFF"
+   );
    Comment(commentText);
   }
 
 //+------------------------------------------------------------------+
-//|  END OF EXPERT ADVISOR                                             |
+//|  END OF EXPERT ADVISOR — ForgeScalper v2.0                       |
 //+------------------------------------------------------------------+
